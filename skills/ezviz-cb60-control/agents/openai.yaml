@@ -1,0 +1,7 @@
+interface:
+  display_name: "EZVIZ CB60 Control"
+  short_description: "Control CB60 PTZ, zoom, snapshots, and stream URLs."
+  default_prompt: "Use $ezviz-cb60-control to operate an EZVIZ CB60 camera without exposing secrets."
+
+policy:
+  allow_implicit_invocation: true

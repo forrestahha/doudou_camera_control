@@ -1,0 +1,11 @@
+{
+  "id": "ezviz-cb60-control",
+  "skills": [
+    "skills"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

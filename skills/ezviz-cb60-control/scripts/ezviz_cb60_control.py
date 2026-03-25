@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""Portable controller for EZVIZ CB60 camera operations.
+
+This script is REST-first and intentionally reads secrets from environment
+variables only. It is designed to be packaged inside an OpenClaw/Codex skill.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Optional
+
+JsonDict = Dict[str, Any]
+
+
+class EzvizError(RuntimeError):
+    """Raised when the EZVIZ API or local execution fails."""
+
+
+def first_nonempty(*values: Any) -> Optional[Any]:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def join_url(base_url: str, path: str) -> str:
+    return base_url.rstrip("/") + "/" + path.lstrip("/")
+
+
+def find_first_url(payload: Any) -> Optional[str]:
+    if isinstance(payload, str):
+        if payload.startswith(("http://", "https://", "rtmp://", "rtsp://", "ws://", "wss://")):
+            return payload
+        return None
+    if isinstance(payload, dict):
+        preferred_keys = (
+            "url",
+            "liveAddress",
+            "hls",
+            "flv",
+            "rtmp",
+            "rtsp",
+            "picUrl",
+            "pictureUrl",
+            "snapshotUrl",
+        )
+        for key in preferred_keys:
+            value = payload.get(key)
+            found = find_first_url(value)
+            if found:
+                return found
+        for value in payload.values():
+            found = find_first_url(value)
+            if found:
+                return found
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            found = find_first_url(item)
+            if found:
+                return found
+    return None
+
+
+def flatten_battery_signals(payload: Any, prefix: str = "") -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            next_prefix = f"{prefix}.{key}" if prefix else key
+            lowered = key.lower()
+            if any(token in lowered for token in ("battery", "battry", "electric", "power", "charge", "capacity")):
+                results[next_prefix] = value
+            results.update(flatten_battery_signals(value, next_prefix))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            next_prefix = f"{prefix}[{index}]"
+            results.update(flatten_battery_signals(value, next_prefix))
+    return results
+
+
+@dataclass
+class EnvConfig:
+    app_key: str = ""
+    app_secret: str = ""
+    access_token: str = ""
+    device_serial: str = ""
+    validate_code: str = ""
+    channel_no: int = 1
+    base_url: str = "https://open.ys7.com"
+    live_url_path: str = ""
+    live_source: str = ""
+    manual_live_url: str = ""
+    timeout_seconds: float = 20.0
+
+    @classmethod
+    def from_env(cls) -> "EnvConfig":
+        channel_raw = os.getenv("EZVIZ_CHANNEL_NO", "1").strip() or "1"
+        try:
+            channel_no = int(channel_raw)
+        except ValueError as exc:
+            raise EzvizError("EZVIZ_CHANNEL_NO must be an integer.") from exc
+
+        return cls(
+            app_key=os.getenv("EZVIZ_APP_KEY", "").strip(),
+            app_secret=os.getenv("EZVIZ_APP_SECRET", "").strip(),
+            access_token=os.getenv("EZVIZ_ACCESS_TOKEN", "").strip(),
+            device_serial=os.getenv("EZVIZ_DEVICE_SERIAL", "").strip(),
+            validate_code=os.getenv("EZVIZ_VALIDATE_CODE", "").strip(),
+            channel_no=channel_no,
+            base_url=os.getenv("EZVIZ_BASE_URL", "https://open.ys7.com").strip() or "https://open.ys7.com",
+            live_url_path=os.getenv("EZVIZ_LIVE_URL_PATH", "").strip(),
+            live_source=os.getenv("EZVIZ_LIVE_SOURCE", "").strip(),
+            manual_live_url=os.getenv("EZVIZ_MANUAL_LIVE_URL", "").strip(),
+            timeout_seconds=float(os.getenv("EZVIZ_TIMEOUT_SECONDS", "20").strip() or "20"),
+        )
+
+    def doctor(self) -> JsonDict:
+        required_now = {
+            "EZVIZ_DEVICE_SERIAL": bool(self.device_serial),
+            "EZVIZ_ACCESS_TOKEN": bool(self.access_token),
+        }
+        optional_refresh = {
+            "EZVIZ_APP_KEY": bool(self.app_key),
+            "EZVIZ_APP_SECRET": bool(self.app_secret),
+            "EZVIZ_VALIDATE_CODE": bool(self.validate_code),
+        }
+        return {
+            "ok": all(required_now.values()),
+            "required": required_now,
+            "optional": optional_refresh,
+            "channel_no": self.channel_no,
+            "base_url": self.base_url,
+            "live_url_path_override": bool(self.live_url_path),
+            "live_source_override": bool(self.live_source),
+            "manual_live_url_override": bool(self.manual_live_url),
+        }
+
+
+class EzvizClient:
+    PTZ_COMMANDS = {
+        "left": 2,
+        "right": 3,
+        "zoom-in": 8,
+        "zoom-out": 9,
+    }
+
+    LIVE_PATHS = (
+        "/api/lapp/v2/live/address/get",
+        "/api/lapp/live/address/get",
+    )
+    STREAM_MANAGE_PATH = "/api/service/media/streammanage/stream"
+    STREAM_LIST_PATH = "/api/service/media/streammanage/stream/list"
+    STREAM_ADDRESS_PATH = "/api/service/media/streammanage/stream/address"
+    VIDEO_ENCODE_PATH = "/api/v3/das/device/video/encode"
+
+    def __init__(
+        self,
+        config: EnvConfig,
+        requester: Optional[Callable[[urllib.request.Request, float], JsonDict]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        self.config = config
+        self._requester = requester or self._default_request_json
+        self._sleeper = sleeper or time.sleep
+
+    def _default_request_json(self, request: urllib.request.Request, timeout: float) -> JsonDict:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise EzvizError(f"HTTP {exc.code} calling {request.full_url}: {error_body}") from exc
+        except urllib.error.URLError as exc:
+            raise EzvizError(f"Network error calling {request.full_url}: {exc}") from exc
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise EzvizError(f"Non-JSON response from {request.full_url}: {body[:200]}") from exc
+
+        if not isinstance(payload, dict):
+            raise EzvizError(f"Unexpected response shape from {request.full_url}: {type(payload).__name__}")
+        return payload
+
+    def _post_form(self, path: str, params: JsonDict) -> JsonDict:
+        return self._request_form("POST", path, form_params=params)
+
+    def _request_form(
+        self,
+        method: str,
+        path: str,
+        *,
+        form_params: Optional[JsonDict] = None,
+        query_params: Optional[JsonDict] = None,
+        header_params: Optional[JsonDict] = None,
+    ) -> JsonDict:
+        encoded = None
+        if form_params:
+            encoded = urllib.parse.urlencode(form_params).encode("utf-8")
+
+        url = join_url(self.config.base_url, path)
+        if query_params:
+            filtered = {key: value for key, value in query_params.items() if value not in (None, "")}
+            if filtered:
+                url += "?" + urllib.parse.urlencode(filtered)
+
+        headers = {}
+        if encoded is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if header_params:
+            headers.update({key: str(value) for key, value in header_params.items() if value not in (None, "")})
+
+        request = urllib.request.Request(
+            url,
+            data=encoded,
+            headers=headers,
+            method=method,
+        )
+        payload = self._requester(request, self.config.timeout_seconds)
+        self._ensure_success(payload)
+        return payload
+
+    def _ensure_success(self, payload: JsonDict) -> None:
+        top_code = payload.get("code")
+        if top_code is not None and str(top_code) not in {"0", "200"}:
+            message = first_nonempty(payload.get("msg"), payload.get("message"), payload.get("detail")) or "API error"
+            raise EzvizError(f"{top_code}: {message}")
+
+        meta = payload.get("meta")
+        if isinstance(meta, dict):
+            meta_code = meta.get("code")
+            if meta_code is not None and str(meta_code) not in {"0", "200"}:
+                message = first_nonempty(meta.get("msg"), meta.get("message"), meta.get("detail")) or "API error"
+                raise EzvizError(f"{meta_code}: {message}")
+
+    def _extract_data(self, payload: JsonDict) -> Any:
+        if "data" in payload:
+            return payload["data"]
+        if "result" in payload:
+            return payload["result"]
+        return payload
+
+    def get_access_token(self, force_refresh: bool = False) -> str:
+        if self.config.access_token and not force_refresh:
+            return self.config.access_token
+        if not self.config.app_key or not self.config.app_secret:
+            raise EzvizError("Missing EZVIZ_ACCESS_TOKEN and no app credentials are available for refresh.")
+
+        payload = self._post_form(
+            "/api/lapp/token/get",
+            {
+                "appKey": self.config.app_key,
+                "appSecret": self.config.app_secret,
+            },
+        )
+        data = self._extract_data(payload)
+        token = None
+        if isinstance(data, dict):
+            token = first_nonempty(data.get("accessToken"), data.get("token"))
+        token = token or first_nonempty(payload.get("accessToken"), payload.get("token"))
+        if not isinstance(token, str) or not token:
+            raise EzvizError("Token refresh succeeded but no access token was returned.")
+        self.config.access_token = token
+        return token
+
+    def _device_params(self, channel_no: Optional[int] = None) -> JsonDict:
+        if not self.config.device_serial:
+            raise EzvizError("Missing EZVIZ_DEVICE_SERIAL.")
+        effective_channel_no = self.config.channel_no if channel_no is None else channel_no
+        return {
+            "accessToken": self.get_access_token(),
+            "deviceSerial": self.config.device_serial,
+            "channelNo": effective_channel_no,
+        }
+
+    def ptz_start(self, direction: str, speed: int = 1) -> JsonDict:
+        if direction not in self.PTZ_COMMANDS:
+            raise EzvizError(f"Unsupported PTZ direction: {direction}")
+        params = self._device_params()
+        params.update({"direction": self.PTZ_COMMANDS[direction], "speed": speed})
+        return self._post_form("/api/lapp/device/ptz/start", params)
+
+    def ptz_stop(self, direction: str) -> JsonDict:
+        if direction not in self.PTZ_COMMANDS:
+            raise EzvizError(f"Unsupported PTZ direction: {direction}")
+        params = self._device_params()
+        params.update({"direction": self.PTZ_COMMANDS[direction]})
+        return self._post_form("/api/lapp/device/ptz/stop", params)
+
+    def ptz_pulse(self, direction: str, duration: float = 1.0, speed: int = 1) -> JsonDict:
+        self.ptz_start(direction, speed=speed)
+        try:
+            self._sleeper(duration)
+        finally:
+            stop_payload = self.ptz_stop(direction)
+        return {
+            "direction": direction,
+            "duration_seconds": duration,
+            "speed": speed,
+            "stop_response": self._extract_data(stop_payload),
+        }
+
+    def capture_snapshot(self, output_path: Optional[Path] = None, channel_no: Optional[int] = None) -> JsonDict:
+        payload = self._post_form("/api/lapp/device/capture", self._device_params(channel_no=channel_no))
+        data = self._extract_data(payload)
+        snapshot_url = find_first_url(data)
+        result: JsonDict = {
+            "snapshot_url": snapshot_url,
+            "raw": data,
+        }
+        if output_path:
+            if not snapshot_url:
+                raise EzvizError("Snapshot call succeeded but no downloadable snapshot URL was returned.")
+            self._download(snapshot_url, output_path)
+            result["downloaded_to"] = str(output_path)
+        return result
+
+    def _download(self, url: str, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=self.config.timeout_seconds) as response:
+            output_path.write_bytes(response.read())
+
+    def get_live_url(
+        self,
+        expire_seconds: int = 300,
+        protocol_id: Optional[int] = None,
+        source: Optional[str] = None,
+        channel_no: Optional[int] = None,
+    ) -> JsonDict:
+        if self.config.manual_live_url and channel_no in (None, self.config.channel_no):
+            return {
+                "path": "manual",
+                "stream_url": self.config.manual_live_url,
+                "raw": {"manual": True},
+            }
+        params = self._device_params(channel_no=channel_no)
+        params["expireTime"] = expire_seconds
+        if protocol_id is not None:
+            params["protocol"] = protocol_id
+        live_source = first_nonempty(source, self.config.live_source)
+        if live_source:
+            params["source"] = live_source
+
+        candidate_paths = [self.config.live_url_path] if self.config.live_url_path else list(self.LIVE_PATHS)
+        errors = []
+        for path in candidate_paths:
+            try:
+                payload = self._post_form(path, params)
+                data = self._extract_data(payload)
+                stream_url = find_first_url(data)
+                if not stream_url:
+                    raise EzvizError("No stream URL field was found in the response payload.")
+                return {
+                    "path": path,
+                    "stream_url": stream_url,
+                    "raw": data,
+                }
+            except EzvizError as exc:
+                errors.append(f"{path}: {exc}")
+        raise EzvizError("Failed to get live stream URL. " + " | ".join(errors))
+
+    def diagnose_preview(self, url: Optional[str] = None) -> JsonDict:
+        target = first_nonempty(url, self.config.manual_live_url)
+        if not isinstance(target, str) or not target:
+            raise EzvizError("No preview URL provided. Pass --url or set EZVIZ_MANUAL_LIVE_URL.")
+
+        parsed = urllib.parse.urlparse(target)
+        query = urllib.parse.parse_qs(parsed.query)
+        diagnosis = {
+            "scheme": parsed.scheme,
+            "host": parsed.netloc,
+            "path": parsed.path,
+            "hints": [],
+        }
+
+        support_h265 = query.get("supportH265", [])
+        if support_h265 and support_h265[-1] == "1":
+            diagnosis["hints"].append("The URL requests H.265 playback. Use a player or SDK that supports H.265.")
+
+        if "expire" in query:
+            diagnosis["hints"].append("This is a signed temporary URL. If playback fails later, regenerate a fresh URL.")
+
+        if parsed.scheme == "ezopen":
+            diagnosis["hints"].append("If playback fails and device video encryption is enabled, include the device verify code in the ezopen URL.")
+            if "@" not in target.split("open.ys7.com", 1)[0]:
+                diagnosis["hints"].append("Current ezopen URL does not appear to embed a verify code before open.ys7.com.")
+        elif parsed.scheme in {"https", "http"} and parsed.path.endswith(".m3u8"):
+            diagnosis["hints"].append("HLS playback works best in players with H.265 support. Safari/VLC are common checks.")
+        elif parsed.scheme in {"https", "http"} and parsed.path.endswith(".flv"):
+            diagnosis["hints"].append("HTTP-FLV usually needs flv.js or a player that explicitly supports FLV over HTTP.")
+        elif parsed.scheme == "rtmp":
+            diagnosis["hints"].append("RTMP playback usually needs ffplay, VLC, OBS, or another RTMP-capable player.")
+
+        if not diagnosis["hints"]:
+            diagnosis["hints"].append("No obvious URL issue detected. Verify codec support, encryption, and URL freshness.")
+        return diagnosis
+
+    def get_device_status(self, channel_no: Optional[int] = None) -> JsonDict:
+        payload = self._post_form("/api/lapp/device/status/get", self._device_params(channel_no=channel_no))
+        data = self._extract_data(payload)
+        return {
+            "channel_no": self.config.channel_no if channel_no is None else channel_no,
+            "raw": data,
+        }
+
+    def get_device_info(self) -> JsonDict:
+        payload = self._post_form(
+            "/api/lapp/device/info",
+            {
+                "accessToken": self.get_access_token(),
+                "deviceSerial": self.config.device_serial,
+            },
+        )
+        data = self._extract_data(payload)
+        return {
+            "device_serial": self.config.device_serial,
+            "raw": data,
+        }
+
+    def get_video_encode(self, stream_type: int = 1, channel_no: Optional[int] = None) -> JsonDict:
+        effective_channel = self.config.channel_no if channel_no is None else channel_no
+        payload = self._request_form(
+            "GET",
+            self.VIDEO_ENCODE_PATH,
+            query_params={"streamType": stream_type},
+            header_params={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "accessToken": self.get_access_token(),
+                "deviceSerial": self.config.device_serial,
+                "channelNo": effective_channel,
+            },
+        )
+        data = self._extract_data(payload)
+        return {
+            "device_serial": self.config.device_serial,
+            "channel_no": effective_channel,
+            "stream_type": stream_type,
+            "video_code": data.get("videoCode") if isinstance(data, dict) else None,
+            "raw": data,
+        }
+
+    def set_video_encode(self, encode_type: str, channel_no: Optional[int] = None) -> JsonDict:
+        normalized = encode_type.upper()
+        if normalized not in {"H264", "H265"}:
+            raise EzvizError("encode_type must be H264 or H265.")
+        effective_channel = self.config.channel_no if channel_no is None else channel_no
+        payload = self._request_form(
+            "POST",
+            self.VIDEO_ENCODE_PATH,
+            form_params={"encodeType": normalized},
+            header_params={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "accessToken": self.get_access_token(),
+                "deviceSerial": self.config.device_serial,
+                "channelNo": effective_channel,
+            },
+        )
+        return {
+            "device_serial": self.config.device_serial,
+            "channel_no": effective_channel,
+            "encode_type": normalized,
+            "raw": self._extract_data(payload),
+        }
+
+    def create_stream(
+        self,
+        *,
+        start_time: str,
+        end_time: str,
+        local_index: Optional[int] = None,
+        access_type: int = 1,
+    ) -> JsonDict:
+        effective_local_index = self.config.channel_no if local_index is None else local_index
+        payload = self._request_form(
+            "POST",
+            self.STREAM_MANAGE_PATH,
+            query_params={
+                "accessType": access_type,
+                "startTime": start_time,
+                "endTime": end_time,
+            },
+            header_params={
+                "accessToken": self.get_access_token(),
+                "deviceSerial": self.config.device_serial,
+                "localIndex": effective_local_index,
+            },
+        )
+        data = self._extract_data(payload)
+        return {
+            "device_serial": self.config.device_serial,
+            "local_index": effective_local_index,
+            "stream_id": data.get("streamId") if isinstance(data, dict) else None,
+            "raw": data,
+        }
+
+    def update_stream(self, *, stream_id: str, start_time: str, end_time: str) -> JsonDict:
+        payload = self._request_form(
+            "PUT",
+            self.STREAM_MANAGE_PATH,
+            query_params={
+                "streamId": stream_id,
+                "startTime": start_time,
+                "endTime": end_time,
+            },
+            header_params={
+                "accessToken": self.get_access_token(),
+            },
+        )
+        return {
+            "stream_id": stream_id,
+            "raw": self._extract_data(payload),
+        }
+
+    def list_streams(
+        self,
+        *,
+        stream_id: Optional[str] = None,
+        device_serial: Optional[str] = None,
+        page_start: int = 0,
+        page_size: int = 50,
+        access_type: int = 1,
+        status: Optional[int] = None,
+    ) -> JsonDict:
+        payload = self._request_form(
+            "GET",
+            self.STREAM_LIST_PATH,
+            query_params={
+                "streamId": stream_id,
+                "pageStart": page_start,
+                "pageSize": page_size,
+                "accessType": access_type,
+                "status": status,
+            },
+            header_params={
+                "accessToken": self.get_access_token(),
+                "deviceSerial": first_nonempty(device_serial, self.config.device_serial),
+            },
+        )
+        data = self._extract_data(payload)
+        return {
+            "raw": data,
+            "stream_list": data.get("streamList", []) if isinstance(data, dict) else [],
+        }
+
+    def get_stream_address(
+        self,
+        *,
+        stream_id: str,
+        protocol: int,
+        quality: int = 1,
+        support_h265: int = 0,
+        mute: int = 0,
+        address_type: int = 1,
+        expire_time: Optional[int] = None,
+    ) -> JsonDict:
+        payload = self._request_form(
+            "GET",
+            self.STREAM_ADDRESS_PATH,
+            query_params={
+                "streamId": stream_id,
+                "protocol": protocol,
+                "quality": quality,
+                "supportH265": support_h265,
+                "mute": mute,
+                "type": address_type,
+                "expireTime": expire_time,
+            },
+            header_params={
+                "accessToken": self.get_access_token(),
+            },
+        )
+        data = self._extract_data(payload)
+        address = data.get("address") if isinstance(data, dict) else None
+        return {
+            "stream_id": stream_id,
+            "protocol": protocol,
+            "address": address,
+            "raw": data,
+        }
+
+    def get_battery_status(self, channel_no: Optional[int] = None) -> JsonDict:
+        status = self.get_device_status(channel_no=channel_no)
+        raw = status["raw"]
+        signals = flatten_battery_signals(raw)
+        return {
+            "channel_no": status["channel_no"],
+            "battery_signals": signals,
+            "battery_percent": first_nonempty(
+                signals.get("battery"),
+                signals.get("battryStatus"),
+                signals.get("deviceStatus.battery"),
+                signals.get("deviceStatus.battryStatus"),
+            ),
+            "raw": raw,
+        }
+
+    def dump_device(self, channel_no: Optional[int] = None) -> JsonDict:
+        info = self.get_device_info()
+        status = self.get_device_status(channel_no=channel_no)
+        battery = self.get_battery_status(channel_no=channel_no)
+        return {
+            "device_serial": self.config.device_serial,
+            "channel_no": status["channel_no"],
+            "device_info": info["raw"],
+            "device_status": status["raw"],
+            "battery": {
+                "battery_percent": battery["battery_percent"],
+                "battery_signals": battery["battery_signals"],
+            },
+        }
+
+    def probe_channels(
+        self,
+        channels: Iterable[int],
+        output_dir: Optional[Path] = None,
+        expire_seconds: int = 300,
+        protocol_id: Optional[int] = None,
+        source: Optional[str] = None,
+    ) -> JsonDict:
+        results = []
+        for channel in channels:
+            channel_result: JsonDict = {"channel": channel}
+
+            snapshot_output = output_dir / f"channel-{channel}-snapshot.jpg" if output_dir else None
+            try:
+                snapshot = self.capture_snapshot(output_path=snapshot_output, channel_no=channel)
+                channel_result["snapshot"] = {
+                    "ok": True,
+                    "snapshot_url": snapshot.get("snapshot_url"),
+                    "downloaded_to": snapshot.get("downloaded_to"),
+                }
+            except EzvizError as exc:
+                channel_result["snapshot"] = {"ok": False, "error": str(exc)}
+
+            try:
+                live = self.get_live_url(
+                    expire_seconds=expire_seconds,
+                    protocol_id=protocol_id,
+                    source=source,
+                    channel_no=channel,
+                )
+                channel_result["live_url"] = {
+                    "ok": True,
+                    "path": live.get("path"),
+                    "stream_url": live.get("stream_url"),
+                }
+            except EzvizError as exc:
+                channel_result["live_url"] = {"ok": False, "error": str(exc)}
+
+            results.append(channel_result)
+
+        return {
+            "channels": results,
+            "inference": self._infer_channel_probe(results),
+        }
+
+    def _infer_channel_probe(self, results: Iterable[JsonDict]) -> JsonDict:
+        by_channel = {item["channel"]: item for item in results}
+        channel1 = by_channel.get(1)
+        channel2 = by_channel.get(2)
+
+        def channel_has_success(item: Optional[JsonDict]) -> bool:
+            if not item:
+                return False
+            return bool(item.get("snapshot", {}).get("ok") or item.get("live_url", {}).get("ok"))
+
+        if channel_has_success(channel1) and channel_has_success(channel2):
+            return {
+                "status": "possible_second_logical_channel",
+                "message": "Channel 2 returned data. Compare saved snapshots or stream content to confirm it is a distinct lens view.",
+            }
+        if channel_has_success(channel1) and channel2 and not channel_has_success(channel2):
+            return {
+                "status": "likely_single_public_channel",
+                "message": "Channel 1 works but channel 2 does not. This suggests the dual-lens view is not exposed as a second public API channel.",
+            }
+        return {
+            "status": "inconclusive",
+            "message": "Probe did not produce a clean channel-1/channel-2 distinction. Verify credentials, live source, and current device status.",
+        }
+
+    def capabilities(self) -> JsonDict:
+        return {
+            "device_profile": "EZVIZ/萤石 CB60",
+            "implemented": {
+                "pan_left": True,
+                "pan_right": True,
+                "tilt_up": False,
+                "tilt_down": False,
+                "zoom_in": False,
+                "zoom_out": False,
+                "snapshot": True,
+                "live_stream_url": True,
+                "manual_live_url": True,
+                "channel_probe": True,
+                "device_info": True,
+                "device_status": True,
+                "battery_status": True,
+                "stream_manage": True,
+                "video_encode": True,
+            },
+            "verified_runtime": {
+                "pan_left": True,
+                "pan_right": True,
+                "snapshot": True,
+                "zoom_rest_control": False,
+            },
+            "sdk_boundary": {
+                "voice_talk": {
+                    "implemented": False,
+                    "reason": "Official docs expose talk through player SDK methods such as startVoiceTalk, not this portable REST CLI.",
+                }
+            },
+            "notes": {
+                "zoom": "Device metadata advertises focal adjustment, but the real CB60 rejected REST PTZ zoom commands during validation.",
+                "live_url": "Some EZVIZ tenants require the source parameter for live URL retrieval. Set EZVIZ_LIVE_SOURCE or pass --source.",
+                "lens_switch": "No public lens-switch API has been confirmed yet. Use probe-channels to test whether a second logical channel is exposed.",
+                "battery": "Battery data depends on what the device reports through /api/lapp/device/status/get.",
+            },
+        }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Control an EZVIZ CB60 camera via EZVIZ Open Platform APIs.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("capabilities", help="Show the skill's current control surface.")
+    subparsers.add_parser("doctor", help="Show which environment variables are present.")
+
+    ptz_parser = subparsers.add_parser("ptz", help="Move the camera left/right or zoom.")
+    ptz_parser.add_argument("direction", choices=sorted(EzvizClient.PTZ_COMMANDS.keys()))
+    ptz_parser.add_argument("--duration", type=float, default=1.0, help="How long to hold the PTZ action before stop.")
+    ptz_parser.add_argument("--speed", type=int, default=1, help="PTZ speed to request.")
+
+    snapshot_parser = subparsers.add_parser("snapshot", help="Capture a snapshot and optionally download it.")
+    snapshot_parser.add_argument("--output", type=Path, help="Optional local file path to save the snapshot.")
+
+    live_parser = subparsers.add_parser("live-url", help="Fetch a live stream URL for the camera.")
+    live_parser.add_argument("--expire-seconds", type=int, default=300, help="Requested URL lifetime in seconds.")
+    live_parser.add_argument("--protocol-id", type=int, help="Optional numeric protocol value expected by the tenant.")
+    live_parser.add_argument("--source", help="Optional live source parameter required by some EZVIZ tenants.")
+
+    encode_get_parser = subparsers.add_parser("video-encode-get", help="Fetch current device video encoding info.")
+    encode_get_parser.add_argument("--stream-type", type=int, default=1, help="1=main stream, 2=sub stream.")
+    encode_get_parser.add_argument("--channel", type=int, help="Optional channel number override.")
+
+    encode_set_parser = subparsers.add_parser("video-encode-set", help="Set device video encode type to H264 or H265.")
+    encode_set_parser.add_argument("encode_type", choices=["H264", "H265", "h264", "h265"])
+    encode_set_parser.add_argument("--channel", type=int, help="Optional channel number override.")
+
+    stream_create_parser = subparsers.add_parser("stream-create", help="Create a managed live stream for the current device.")
+    stream_create_parser.add_argument("--start-time", required=True, help="Start time, format: YYYY-MM-DD HH:MM:SS")
+    stream_create_parser.add_argument("--end-time", required=True, help="End time, format: YYYY-MM-DD HH:MM:SS")
+    stream_create_parser.add_argument("--local-index", type=int, help="Optional device local index/channel override.")
+    stream_create_parser.add_argument("--access-type", type=int, default=1, help="1=device access, 2=rtmp access")
+
+    stream_update_parser = subparsers.add_parser("stream-update", help="Update a managed live stream time window.")
+    stream_update_parser.add_argument("--stream-id", required=True)
+    stream_update_parser.add_argument("--start-time", required=True, help="Start time, format: YYYY-MM-DD HH:MM:SS")
+    stream_update_parser.add_argument("--end-time", required=True, help="End time, format: YYYY-MM-DD HH:MM:SS")
+
+    stream_list_parser = subparsers.add_parser("stream-list", help="List managed streams for the current device.")
+    stream_list_parser.add_argument("--stream-id")
+    stream_list_parser.add_argument("--page-start", type=int, default=0)
+    stream_list_parser.add_argument("--page-size", type=int, default=50)
+    stream_list_parser.add_argument("--access-type", type=int, default=1)
+    stream_list_parser.add_argument("--status", type=int, choices=[0, 1])
+
+    stream_address_parser = subparsers.add_parser("stream-address", help="Fetch a playback address by streamId.")
+    stream_address_parser.add_argument("--stream-id", required=True)
+    stream_address_parser.add_argument("--protocol", type=int, required=True, choices=[1, 2, 3, 4], help="1=ezopen 2=hls 3=rtmp 4=flv")
+    stream_address_parser.add_argument("--quality", type=int, default=1, choices=[1, 2])
+    stream_address_parser.add_argument("--support-h265", type=int, default=0, choices=[0, 1])
+    stream_address_parser.add_argument("--mute", type=int, default=0, choices=[0, 1])
+    stream_address_parser.add_argument("--address-type", type=int, default=1, choices=[1, 2])
+    stream_address_parser.add_argument("--expire-time", type=int)
+
+    diagnose_parser = subparsers.add_parser("diagnose-preview", help="Diagnose a preview URL or manual stream URL.")
+    diagnose_parser.add_argument("--url", help="Preview URL to inspect. Falls back to EZVIZ_MANUAL_LIVE_URL.")
+
+    probe_parser = subparsers.add_parser("probe-channels", help="Probe whether the device exposes a second logical channel.")
+    probe_parser.add_argument("--channels", nargs="+", type=int, default=[1, 2], help="Channel numbers to probe. Defaults to 1 2.")
+    probe_parser.add_argument("--output-dir", type=Path, help="Optional directory for saving probe snapshots.")
+    probe_parser.add_argument("--expire-seconds", type=int, default=300, help="Requested URL lifetime in seconds.")
+    probe_parser.add_argument("--protocol-id", type=int, help="Optional numeric protocol value expected by the tenant.")
+    probe_parser.add_argument("--source", help="Optional live source parameter required by some EZVIZ tenants.")
+
+    subparsers.add_parser("device-info", help="Fetch raw device info from the EZVIZ device info API.")
+
+    dump_parser = subparsers.add_parser("dump-device", help="Fetch device info, status, and battery in one payload.")
+    dump_parser.add_argument("--channel", type=int, help="Optional channel number override for status and battery.")
+
+    status_parser = subparsers.add_parser("device-status", help="Fetch raw device status from the EZVIZ status API.")
+    status_parser.add_argument("--channel", type=int, help="Optional channel number override.")
+
+    battery_parser = subparsers.add_parser("battery", help="Fetch device status and extract likely battery-related fields.")
+    battery_parser.add_argument("--channel", type=int, help="Optional channel number override.")
+
+    subparsers.add_parser("talk", help="Explain the current voice-talk boundary for this portable skill.")
+    return parser
+
+
+def emit_json(payload: JsonDict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    config = EnvConfig.from_env()
+    client = EzvizClient(config)
+
+    if args.command == "capabilities":
+        emit_json(client.capabilities())
+        return 0
+
+    if args.command == "doctor":
+        emit_json(config.doctor())
+        return 0
+
+    if args.command == "talk":
+        emit_json(
+            {
+                "implemented": False,
+                "reason": "Voice talk is documented by EZVIZ SDK player methods but is not implemented in this portable REST-first script.",
+                "next_step": "Use the official native SDK if full duplex talk is required.",
+            }
+        )
+        return 2
+
+    if args.command == "diagnose-preview":
+        emit_json(client.diagnose_preview(url=args.url))
+        return 0
+    if args.command == "device-info":
+        emit_json(client.get_device_info())
+        return 0
+    if args.command == "video-encode-get":
+        emit_json(client.get_video_encode(stream_type=args.stream_type, channel_no=args.channel))
+        return 0
+    if args.command == "video-encode-set":
+        emit_json(client.set_video_encode(args.encode_type, channel_no=args.channel))
+        return 0
+    if args.command == "stream-create":
+        emit_json(
+            client.create_stream(
+                start_time=args.start_time,
+                end_time=args.end_time,
+                local_index=args.local_index,
+                access_type=args.access_type,
+            )
+        )
+        return 0
+    if args.command == "stream-update":
+        emit_json(
+            client.update_stream(
+                stream_id=args.stream_id,
+                start_time=args.start_time,
+                end_time=args.end_time,
+            )
+        )
+        return 0
+    if args.command == "stream-list":
+        emit_json(
+            client.list_streams(
+                stream_id=args.stream_id,
+                page_start=args.page_start,
+                page_size=args.page_size,
+                access_type=args.access_type,
+                status=args.status,
+            )
+        )
+        return 0
+    if args.command == "stream-address":
+        emit_json(
+            client.get_stream_address(
+                stream_id=args.stream_id,
+                protocol=args.protocol,
+                quality=args.quality,
+                support_h265=args.support_h265,
+                mute=args.mute,
+                address_type=args.address_type,
+                expire_time=args.expire_time,
+            )
+        )
+        return 0
+    if args.command == "dump-device":
+        emit_json(client.dump_device(channel_no=args.channel))
+        return 0
+    if args.command == "device-status":
+        emit_json(client.get_device_status(channel_no=args.channel))
+        return 0
+    if args.command == "battery":
+        emit_json(client.get_battery_status(channel_no=args.channel))
+        return 0
+
+    try:
+        if args.command == "ptz":
+            emit_json(client.ptz_pulse(args.direction, duration=args.duration, speed=args.speed))
+            return 0
+        if args.command == "snapshot":
+            emit_json(client.capture_snapshot(output_path=args.output))
+            return 0
+        if args.command == "live-url":
+            emit_json(
+                client.get_live_url(
+                    expire_seconds=args.expire_seconds,
+                    protocol_id=args.protocol_id,
+                    source=args.source,
+                )
+            )
+            return 0
+        if args.command == "probe-channels":
+            emit_json(
+                client.probe_channels(
+                    channels=args.channels,
+                    output_dir=args.output_dir,
+                    expire_seconds=args.expire_seconds,
+                    protocol_id=args.protocol_id,
+                    source=args.source,
+                )
+            )
+            return 0
+    except EzvizError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
