@@ -16,16 +16,21 @@ SCRIPT_DIR = (
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from cb60_capture_workflow import (  # noqa: E402
+    analyze_failure_frame,
     build_rotated_mp4_command,
     build_raw_recording_path,
+    classify_capture_output,
     capture_next_shot,
-    get_next_pending_shot,
+    extract_failure_frame,
     init_session,
     load_session,
     mark_shot_captured,
     plan_shots,
+    probe_media_metrics,
+    get_next_pending_shot,
     record_flv_clip,
     record_hls_clip,
+    resolve_stream_url,
     session_summary,
     stream_url_path,
 )
@@ -68,6 +73,60 @@ class WorkflowTests(unittest.TestCase):
 
     def test_stream_url_path_ignores_query_string(self):
         self.assertEqual(stream_url_path("https://demo/live.flv?sid=1&t=abc"), "/live.flv")
+
+    def test_resolve_stream_url_prefers_managed_stream_when_configured(self):
+        import cb60_capture_workflow as workflow
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def get_stream_address(self, **kwargs):
+                return {"address": "https://demo/live.flv?sid=managed"}
+
+        config = EnvConfig(
+            access_token="t",
+            device_serial="d",
+            managed_stream_id="stream-long-lived",
+        )
+        old_client = workflow.EzvizClient
+        try:
+            workflow.EzvizClient = FakeClient
+            resolved = resolve_stream_url(config)
+        finally:
+            workflow.EzvizClient = old_client
+
+        self.assertEqual(resolved, "https://demo/live.flv?sid=managed")
+
+    def test_resolve_stream_url_defaults_to_flv_protocol_for_live_lookup(self):
+        import cb60_capture_workflow as workflow
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def get_live_url(self, **kwargs):
+                self.kwargs = kwargs
+                return {"stream_url": "https://demo/live.flv?sid=direct"}
+
+        config = EnvConfig(
+            access_token="t",
+            device_serial="d",
+        )
+        fake_client = FakeClient(config)
+        old_client = workflow.EzvizClient
+        try:
+            workflow.EzvizClient = lambda config: fake_client
+            resolved = resolve_stream_url(config)
+        finally:
+            workflow.EzvizClient = old_client
+
+        self.assertEqual(resolved, "https://demo/live.flv?sid=direct")
+        self.assertEqual(fake_client.kwargs["protocol_id"], 4)
+        self.assertEqual(fake_client.kwargs["quality"], 1)
+        self.assertEqual(fake_client.kwargs["support_h265"], 1)
+        self.assertEqual(fake_client.kwargs["mute"], 0)
+        self.assertEqual(fake_client.kwargs["address_type"], 1)
 
     def test_plan_shots_caps_at_four_and_groups_by_zone(self):
         shots = plan_shots("商品近景, 门头, 制作过程, 收银台, 店内全景", max_shots=4)
@@ -239,6 +298,15 @@ class WorkflowTests(unittest.TestCase):
                     session_path=session_path,
                     config=EnvConfig(access_token="t", device_serial="d", manual_live_url="https://demo/live.m3u8"),
                     transcode_func=fake_transcode,
+                    probe_func=lambda _path: {
+                        "duration_seconds": 15.0,
+                        "size_bytes": 1234,
+                        "width": 1080,
+                        "height": 1920,
+                        "video_codec": "h264",
+                        "audio_codec": "aac",
+                    },
+                    classify_func=lambda _metrics, _target: "accepted",
                     rotation_mode="cw90",
                 )
             finally:
@@ -253,6 +321,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(reloaded["shots"][0]["raw_output_path"].endswith(".ts"))
             self.assertTrue(payload["conversion"]["ok"])
             self.assertEqual(payload["conversion"]["layout"], "cw90")
+            self.assertEqual(reloaded["shots"][0]["validation"]["status"], "accepted")
+            self.assertTrue(Path(payload["workflow_log_path"]).exists())
+            self.assertTrue(Path(payload["workflow_report_path"]).exists())
 
     def test_capture_next_shot_falls_back_when_mp4_conversion_is_unavailable(self):
         playlist = "\n".join(
@@ -289,6 +360,15 @@ class WorkflowTests(unittest.TestCase):
                     session_path=session_path,
                     config=EnvConfig(access_token="t", device_serial="d", manual_live_url="https://demo/live.m3u8"),
                     transcode_func=lambda *_: {"ok": False, "reason": "ffmpeg_not_found"},
+                    probe_func=lambda _path: {
+                        "duration_seconds": 15.0,
+                        "size_bytes": 1234,
+                        "width": 1080,
+                        "height": 1920,
+                        "video_codec": "mpegts",
+                        "audio_codec": "",
+                    },
+                    classify_func=lambda _metrics, _target: "accepted",
                 )
             finally:
                 workflow.fetch_bytes = old_fetcher
@@ -298,6 +378,92 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(reloaded["shots"][0]["output_path"].endswith(".ts"))
             self.assertEqual(reloaded["shots"][0]["raw_output_path"], reloaded["shots"][0]["output_path"])
             self.assertFalse(payload["conversion"]["ok"])
+            self.assertEqual(reloaded["shots"][0]["validation"]["status"], "accepted")
+
+    def test_capture_next_shot_extracts_failure_frame_and_analysis_for_abnormal_clip(self):
+        playlist = "\n".join(
+            [
+                "#EXTM3U",
+                "#EXTINF:15.0,",
+                "seg-1.ts",
+            ]
+        ).encode("utf-8")
+        blobs = {
+            "https://demo/live.m3u8": playlist,
+            "https://demo/seg-1.ts": b"AAA",
+        }
+
+        def fake_fetcher(url: str, timeout: float) -> bytes:
+            return blobs[url]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = init_session("门头", Path(tmp))
+            session_path = Path(session["storage_root"]) / "session.json"
+            import cb60_capture_workflow as workflow
+
+            old_fetcher = workflow.fetch_bytes
+            old_record = workflow.record_hls_clip
+            try:
+                workflow.fetch_bytes = fake_fetcher
+
+                def patched_record(*args, **kwargs):
+                    kwargs["fetcher"] = fake_fetcher
+                    return old_record(*args, **kwargs)
+
+                workflow.record_hls_clip = patched_record
+
+                def fake_transcode(input_path: Path, rotation_mode: str):
+                    output_path = input_path.with_suffix(".mp4")
+                    output_path.write_bytes(b"bad-mp4")
+                    return {"ok": True, "output_path": str(output_path), "layout": rotation_mode}
+
+                def fake_extract(input_path: Path, output_path: Path, second: float):
+                    output_path.write_bytes(b"jpeg")
+                    return output_path
+
+                payload = capture_next_shot(
+                    session_path=session_path,
+                    config=EnvConfig(access_token="t", device_serial="d", manual_live_url="https://demo/live.m3u8"),
+                    transcode_func=fake_transcode,
+                    probe_func=lambda _path: {
+                        "duration_seconds": 6.0,
+                        "size_bytes": 456,
+                        "width": 288,
+                        "height": 512,
+                        "video_codec": "h264",
+                        "audio_codec": "aac",
+                    },
+                    classify_func=lambda _metrics, _target: "abnormal",
+                    extract_frame_func=fake_extract,
+                    analyze_failure_func=lambda frame, metrics: f"分析完成:{frame.name}:{metrics['width']}x{metrics['height']}",
+                )
+            finally:
+                workflow.fetch_bytes = old_fetcher
+                workflow.record_hls_clip = old_record
+
+            reloaded = load_session(session_path)
+            validation = reloaded["shots"][0]["validation"]
+            self.assertEqual(validation["status"], "abnormal")
+            self.assertIn("分析完成", validation["analysis"])
+            self.assertTrue(Path(validation["frame_path"]).exists())
+            self.assertEqual(payload["captured_shot"]["validation"]["status"], "abnormal")
+
+    def test_classify_capture_output_distinguishes_accepted_abnormal_failed(self):
+        self.assertEqual(
+            classify_capture_output(
+                {"duration_seconds": 20.0, "width": 1080, "height": 1920, "video_codec": "h264"},
+                20,
+            ),
+            "accepted",
+        )
+        self.assertEqual(
+            classify_capture_output(
+                {"duration_seconds": 6.0, "width": 288, "height": 512, "video_codec": "h264"},
+                20,
+            ),
+            "abnormal",
+        )
+        self.assertEqual(classify_capture_output({}, 20), "failed")
 
 
 if __name__ == "__main__":

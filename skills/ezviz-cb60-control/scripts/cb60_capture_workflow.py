@@ -16,10 +16,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from ezviz_cb60_control import EnvConfig, EzvizClient, EzvizError
+from ezviz_cb60_control import EnvConfig, EzvizClient, EzvizError, extract_env_file_arg
 
 JsonDict = Dict[str, Any]
 RotationMode = str
+DEFAULT_LIVE_PROTOCOL_ID = 4
+DEFAULT_LIVE_QUALITY = 1
+DEFAULT_LIVE_SUPPORT_H265 = 1
+DEFAULT_LIVE_MUTE = 0
+DEFAULT_LIVE_ADDRESS_TYPE = 1
+DEFAULT_LOG_NAME = "capture-log.jsonl"
+DEFAULT_REPORT_NAME = "capture-report.md"
 
 
 ZONE_ORDER = {
@@ -228,6 +235,10 @@ def init_session(brief: str, session_root: Path, max_shots: int = 4) -> JsonDict
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "brief": brief,
         "storage_root": str(session_dir),
+        "workflow_artifacts": {
+            "log_path": str(session_dir / DEFAULT_LOG_NAME),
+            "report_path": str(session_dir / DEFAULT_REPORT_NAME),
+        },
         "shots": shots,
         "move_policy": {
             "max_shots": max_shots,
@@ -445,7 +456,28 @@ def resolve_stream_url(
     protocol_id: Optional[int] = None,
 ) -> str:
     client = EzvizClient(config)
-    live = client.get_live_url(source=source, protocol_id=protocol_id)
+    if config.managed_stream_id:
+        managed = client.get_stream_address(
+            stream_id=config.managed_stream_id,
+            protocol=config.managed_stream_protocol,
+            quality=config.managed_stream_quality,
+            support_h265=config.managed_stream_support_h265,
+            mute=config.managed_stream_mute,
+        )
+        stream_url = managed["address"]
+        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
+            raise EzvizError("Managed stream address did not return a supported HLS or FLV URL.")
+        return stream_url
+
+    effective_protocol_id = protocol_id if protocol_id is not None else DEFAULT_LIVE_PROTOCOL_ID
+    live = client.get_live_url(
+        source=source,
+        protocol_id=effective_protocol_id,
+        quality=DEFAULT_LIVE_QUALITY,
+        support_h265=DEFAULT_LIVE_SUPPORT_H265,
+        mute=DEFAULT_LIVE_MUTE,
+        address_type=DEFAULT_LIVE_ADDRESS_TYPE,
+    )
     stream_url = live["stream_url"]
     if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
         raise EzvizError("The workflow recorder currently supports HLS (.m3u8) and FLV (.flv) stream URLs only.")
@@ -456,6 +488,203 @@ def build_raw_recording_path(output_path: Path, stream_url: str) -> Path:
     if stream_url_path(stream_url).endswith(".flv"):
         return output_path.with_suffix(".flv")
     return output_path.with_suffix(".ts")
+
+
+def workflow_log_path(session: JsonDict, session_path: Path) -> Path:
+    artifacts = session.get("workflow_artifacts", {})
+    configured = artifacts.get("log_path")
+    if isinstance(configured, str) and configured:
+        return Path(configured)
+    return session_path.parent / DEFAULT_LOG_NAME
+
+
+def workflow_report_path(session: JsonDict, session_path: Path) -> Path:
+    artifacts = session.get("workflow_artifacts", {})
+    configured = artifacts.get("report_path")
+    if isinstance(configured, str) and configured:
+        return Path(configured)
+    return session_path.parent / DEFAULT_REPORT_NAME
+
+
+def append_workflow_log(session: JsonDict, session_path: Path, event: str, payload: JsonDict) -> Path:
+    log_path = workflow_log_path(session, session_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        "session_id": session.get("session_id"),
+        "payload": payload,
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return log_path
+
+
+def ffprobe_json(media_path: Path) -> JsonDict:
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path or not media_path.exists():
+        return {}
+
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration,size:stream=index,codec_type,codec_name,width,height",
+        "-of",
+        "json",
+        str(media_path),
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return {}
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def probe_media_metrics(media_path: Path) -> JsonDict:
+    payload = ffprobe_json(media_path)
+    streams = payload.get("streams", [])
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+    format_info = payload.get("format", {})
+
+    def as_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def as_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "duration_seconds": as_float(format_info.get("duration")),
+        "size_bytes": as_int(format_info.get("size")),
+        "width": as_int(video_stream.get("width")),
+        "height": as_int(video_stream.get("height")),
+        "video_codec": video_stream.get("codec_name", ""),
+        "audio_codec": audio_stream.get("codec_name", ""),
+    }
+
+
+def classify_capture_output(metrics: JsonDict, target_duration: int) -> str:
+    if not metrics:
+        return "failed"
+
+    duration = float(metrics.get("duration_seconds", 0.0) or 0.0)
+    width = int(metrics.get("width", 0) or 0)
+    height = int(metrics.get("height", 0) or 0)
+    min_duration = max(float(target_duration) - 2.0, float(target_duration) * 0.8)
+
+    if duration >= min_duration and width >= 1000 and height >= 1000:
+        return "accepted"
+    if duration > 0.0:
+        return "abnormal"
+    return "failed"
+
+
+def extract_failure_frame(input_path: Path, output_path: Path, second: float = 1.0) -> Optional[Path]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path or not input_path.exists():
+        return None
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-ss",
+        str(second),
+        "-i",
+        str(input_path),
+        "-frames:v",
+        "1",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0 or not output_path.exists():
+        return None
+    return output_path
+
+
+def analyze_failure_frame(frame_path: Optional[Path], metrics: JsonDict) -> str:
+    duration = round(float(metrics.get("duration_seconds", 0.0) or 0.0), 3)
+    width = int(metrics.get("width", 0) or 0)
+    height = int(metrics.get("height", 0) or 0)
+    video_codec = metrics.get("video_codec") or "unknown"
+    audio_codec = metrics.get("audio_codec") or "unknown"
+    analysis_parts = [
+        "录制结果异常。",
+        f"时长={duration}s。",
+        f"分辨率={width}x{height}。",
+        f"视频编码={video_codec}。",
+        f"音频编码={audio_codec}。",
+    ]
+
+    if frame_path and shutil.which("tesseract"):
+        command = [
+            "tesseract",
+            str(frame_path),
+            "stdout",
+            "--psm",
+            "6",
+        ]
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        text = " ".join(completed.stdout.split())
+        if text:
+            analysis_parts.append(f"OCR文本={text[:240]}")
+        else:
+            analysis_parts.append("OCR未识别到可读文字。")
+    elif frame_path:
+        analysis_parts.append("已保存异常帧，但当前机器未安装 tesseract，未执行 OCR。")
+    else:
+        analysis_parts.append("未能抽取异常帧。")
+    return " ".join(analysis_parts)
+
+
+def render_workflow_report(session: JsonDict, session_path: Path) -> Path:
+    report_path = workflow_report_path(session, session_path)
+    shots = session.get("shots", [])
+    accepted_count = sum(1 for shot in shots if shot.get("validation", {}).get("status") == "accepted")
+    abnormal_count = sum(1 for shot in shots if shot.get("validation", {}).get("status") == "abnormal")
+    failed_count = sum(1 for shot in shots if shot.get("validation", {}).get("status") == "failed")
+    lines = [
+        "# CB60 Capture Workflow Report",
+        "",
+        f"- Session ID: {session.get('session_id')}",
+        f"- Brief: {session.get('brief')}",
+        f"- Created at: {session.get('created_at')}",
+        f"- Storage root: {session.get('storage_root')}",
+        "- Default live chain: protocol=4, quality=1, supportH265=1, type=1",
+        f"- Accepted shots: {accepted_count}",
+        f"- Abnormal shots: {abnormal_count}",
+        f"- Failed shots: {failed_count}",
+        "",
+        "## Shots",
+        "",
+        "| # | Label | Capture | Validation | Output | Notes |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for shot in shots:
+        validation = shot.get("validation", {})
+        note = validation.get("analysis") or ""
+        note = note.replace("|", "/")[:120]
+        lines.append(
+            "| {index} | {label} | {capture} | {validation_status} | {output_path} | {note} |".format(
+                index=shot.get("index", "-"),
+                label=shot.get("label", ""),
+                capture=shot.get("status", ""),
+                validation_status=validation.get("status", "pending"),
+                output_path=Path(shot.get("output_path", "")).name,
+                note=note,
+            )
+        )
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
 
 
 def record_stream_clip(
@@ -486,6 +715,12 @@ def capture_next_shot(
     stream_url: Optional[str] = None,
     rotation_mode: RotationMode = "cw90",
     transcode_func: Callable[[Path, RotationMode], JsonDict] = transcode_recording_to_mp4,
+    probe_func: Callable[[Path], JsonDict] = probe_media_metrics,
+    classify_func: Callable[[JsonDict, int], str] = classify_capture_output,
+    extract_frame_func: Callable[[Path, Path, float], Optional[Path]] = extract_failure_frame,
+    analyze_failure_func: Callable[[Optional[Path], JsonDict], str] = analyze_failure_frame,
+    log_func: Callable[[JsonDict, Path, str, JsonDict], Path] = append_workflow_log,
+    report_func: Callable[[JsonDict, Path], Path] = render_workflow_report,
 ) -> JsonDict:
     session = load_session(session_path)
     shot = get_next_pending_shot(session)
@@ -496,6 +731,23 @@ def capture_next_shot(
         }
 
     effective_stream_url = stream_url or resolve_stream_url(config, source=source, protocol_id=protocol_id)
+    log_path = log_func(
+        session,
+        session_path,
+        "capture_started",
+        {
+            "shot_index": shot["index"],
+            "shot_id": shot["shot_id"],
+            "rotation_mode": rotation_mode,
+            "stream_url": effective_stream_url,
+            "default_live_chain": {
+                "protocol": DEFAULT_LIVE_PROTOCOL_ID,
+                "quality": DEFAULT_LIVE_QUALITY,
+                "support_h265": DEFAULT_LIVE_SUPPORT_H265,
+                "type": DEFAULT_LIVE_ADDRESS_TYPE,
+            },
+        },
+    )
     raw_output_path = build_raw_recording_path(Path(shot["output_path"]), effective_stream_url)
     result = record_stream_clip(
         stream_url=effective_stream_url,
@@ -508,15 +760,50 @@ def capture_next_shot(
     if conversion.get("ok") and isinstance(conversion.get("output_path"), str):
         final_output_path = conversion["output_path"]
 
+    inspection_path = Path(final_output_path)
+    metrics = probe_func(inspection_path) if inspection_path.exists() else {}
+    validation_status = classify_func(metrics, int(shot["duration_seconds"]))
+    frame_path: Optional[Path] = None
+    failure_analysis = ""
+    if validation_status != "accepted" and inspection_path.exists():
+        frame_path = extract_frame_func(
+            inspection_path,
+            session_path.parent / "shots" / f"{shot['index']:02d}-{shot['shot_id']}-failure-frame.jpg",
+            1.0,
+        )
+        failure_analysis = analyze_failure_func(frame_path, metrics)
+
     captured = mark_shot_captured(session, shot["index"], output_path=final_output_path)
     captured["raw_output_path"] = result["output_path"]
+    captured["validation"] = {
+        "status": validation_status,
+        "metrics": metrics,
+        "frame_path": str(frame_path) if frame_path else None,
+        "analysis": failure_analysis,
+    }
     save_session(session_path, session)
+    report_path = report_func(session, session_path)
+    log_func(
+        session,
+        session_path,
+        "capture_completed",
+        {
+            "shot_index": shot["index"],
+            "shot_id": shot["shot_id"],
+            "recording": result,
+            "conversion": conversion,
+            "validation": captured["validation"],
+            "final_output_path": final_output_path,
+        },
+    )
 
     next_shot = get_next_pending_shot(session)
     payload = {
         "captured_shot": captured,
         "recording": result,
         "conversion": conversion,
+        "workflow_log_path": str(log_path),
+        "workflow_report_path": str(report_path),
         "summary": session_summary(session),
     }
     if next_shot:
@@ -566,8 +853,13 @@ def emit_json(payload: JsonDict) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        normalized_argv, env_file = extract_env_file_arg(argv)
+    except EzvizError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(normalized_argv)
 
     if args.command == "init-session":
         session = init_session(args.brief, args.session_root, max_shots=min(max(args.max_shots, 1), 4))
@@ -600,7 +892,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             payload = capture_next_shot(
                 session_path=args.session,
-                config=EnvConfig.from_env(),
+                config=EnvConfig.from_env(env_file=env_file),
                 source=args.source,
                 protocol_id=args.protocol_id,
                 stream_url=args.stream_url,

@@ -8,8 +8,10 @@ variables only. It is designed to be packaged inside an OpenClaw/Codex skill.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+import shlex
 import sys
 import time
 import urllib.error
@@ -88,6 +90,125 @@ def flatten_battery_signals(payload: Any, prefix: str = "") -> Dict[str, Any]:
     return results
 
 
+def load_env_file(path: str) -> Dict[str, str]:
+    env_path = Path(path).expanduser()
+    if not env_path.exists():
+        raise EzvizError(f"Env file not found: {env_path}")
+    values: Dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            raise EzvizError(f"Invalid env file line: {raw_line}")
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        try:
+            parsed = shlex.split(raw_value)
+        except ValueError as exc:
+            raise EzvizError(f"Invalid env file value for {key}: {exc}") from exc
+        values[key] = parsed[0] if parsed else ""
+    return values
+
+
+def write_env_file(path: Path, values: Dict[str, str]) -> Path:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    ordered_keys = (
+        "EZVIZ_APP_KEY",
+        "EZVIZ_APP_SECRET",
+        "EZVIZ_ACCESS_TOKEN",
+        "EZVIZ_DEVICE_SERIAL",
+        "EZVIZ_VALIDATE_CODE",
+        "EZVIZ_CHANNEL_NO",
+    )
+    for key in ordered_keys:
+        value = values.get(key, "")
+        lines.append(f"export {key}={value!r}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def run_setup_wizard(
+    *,
+    output_path: Path,
+    force: bool = False,
+    prompt_func: Callable[[str], str] = input,
+    secret_prompt_func: Callable[[str], str] = getpass.getpass,
+) -> JsonDict:
+    target_path = output_path.expanduser()
+    if target_path.exists() and not force:
+        overwrite = prompt_func(f"{target_path} 已存在，是否覆盖？输入 yes 继续: ").strip().lower()
+        if overwrite not in {"y", "yes"}:
+            raise EzvizError("安装向导已取消，现有环境文件未改动。")
+
+    app_key = secret_prompt_func("EZVIZ_APP_KEY: ").strip()
+    app_secret = secret_prompt_func("EZVIZ_APP_SECRET: ").strip()
+    access_token = secret_prompt_func("EZVIZ_ACCESS_TOKEN: ").strip()
+    device_serial = prompt_func("EZVIZ_DEVICE_SERIAL: ").strip()
+    validate_code = secret_prompt_func("EZVIZ_VALIDATE_CODE: ").strip()
+    channel_raw = prompt_func("EZVIZ_CHANNEL_NO (默认 1): ").strip() or "1"
+
+    try:
+        channel_no = int(channel_raw)
+    except ValueError as exc:
+        raise EzvizError("EZVIZ_CHANNEL_NO 必须是整数。") from exc
+
+    required_values = {
+        "EZVIZ_APP_KEY": app_key,
+        "EZVIZ_APP_SECRET": app_secret,
+        "EZVIZ_ACCESS_TOKEN": access_token,
+        "EZVIZ_DEVICE_SERIAL": device_serial,
+        "EZVIZ_VALIDATE_CODE": validate_code,
+        "EZVIZ_CHANNEL_NO": str(channel_no),
+    }
+    missing = [key for key, value in required_values.items() if not value]
+    if missing:
+        raise EzvizError("安装向导失败，以下字段不能为空: " + ", ".join(missing))
+
+    written_path = write_env_file(target_path, required_values)
+    return {
+        "ok": True,
+        "env_file": str(written_path),
+        "next_step": f"source {written_path}",
+        "keys_written": [
+            "EZVIZ_APP_KEY",
+            "EZVIZ_APP_SECRET",
+            "EZVIZ_ACCESS_TOKEN",
+            "EZVIZ_DEVICE_SERIAL",
+            "EZVIZ_VALIDATE_CODE",
+            "EZVIZ_CHANNEL_NO",
+        ],
+    }
+
+
+def extract_env_file_arg(argv: Optional[Iterable[str]]) -> tuple[list[str], Optional[str]]:
+    items = list(argv if argv is not None else sys.argv[1:])
+    cleaned: list[str] = []
+    env_file: Optional[str] = None
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item == "--env-file":
+            if index + 1 >= len(items):
+                raise EzvizError("--env-file requires a path argument.")
+            env_file = items[index + 1]
+            index += 2
+            continue
+        if item.startswith("--env-file="):
+            env_file = item.split("=", 1)[1]
+            index += 1
+            continue
+        cleaned.append(item)
+        index += 1
+    return cleaned, env_file
+
+
 @dataclass
 class EnvConfig:
     app_key: str = ""
@@ -100,28 +221,49 @@ class EnvConfig:
     live_url_path: str = ""
     live_source: str = ""
     manual_live_url: str = ""
+    managed_stream_id: str = ""
+    managed_stream_protocol: int = 3
+    managed_stream_quality: int = 1
+    managed_stream_support_h265: int = 1
+    managed_stream_mute: int = 0
     timeout_seconds: float = 20.0
 
     @classmethod
-    def from_env(cls) -> "EnvConfig":
-        channel_raw = os.getenv("EZVIZ_CHANNEL_NO", "1").strip() or "1"
+    def from_env(cls, env_file: Optional[str] = None) -> "EnvConfig":
+        env = dict(os.environ)
+        if env_file:
+            env.update(load_env_file(env_file))
+
+        channel_raw = env.get("EZVIZ_CHANNEL_NO", "1").strip() or "1"
         try:
             channel_no = int(channel_raw)
         except ValueError as exc:
             raise EzvizError("EZVIZ_CHANNEL_NO must be an integer.") from exc
 
+        def parse_int_env(name: str, default: int) -> int:
+            raw = env.get(name, str(default)).strip() or str(default)
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise EzvizError(f"{name} must be an integer.") from exc
+
         return cls(
-            app_key=os.getenv("EZVIZ_APP_KEY", "").strip(),
-            app_secret=os.getenv("EZVIZ_APP_SECRET", "").strip(),
-            access_token=os.getenv("EZVIZ_ACCESS_TOKEN", "").strip(),
-            device_serial=os.getenv("EZVIZ_DEVICE_SERIAL", "").strip(),
-            validate_code=os.getenv("EZVIZ_VALIDATE_CODE", "").strip(),
+            app_key=env.get("EZVIZ_APP_KEY", "").strip(),
+            app_secret=env.get("EZVIZ_APP_SECRET", "").strip(),
+            access_token=env.get("EZVIZ_ACCESS_TOKEN", "").strip(),
+            device_serial=env.get("EZVIZ_DEVICE_SERIAL", "").strip(),
+            validate_code=env.get("EZVIZ_VALIDATE_CODE", "").strip(),
             channel_no=channel_no,
-            base_url=os.getenv("EZVIZ_BASE_URL", "https://open.ys7.com").strip() or "https://open.ys7.com",
-            live_url_path=os.getenv("EZVIZ_LIVE_URL_PATH", "").strip(),
-            live_source=os.getenv("EZVIZ_LIVE_SOURCE", "").strip(),
-            manual_live_url=os.getenv("EZVIZ_MANUAL_LIVE_URL", "").strip(),
-            timeout_seconds=float(os.getenv("EZVIZ_TIMEOUT_SECONDS", "20").strip() or "20"),
+            base_url=env.get("EZVIZ_BASE_URL", "https://open.ys7.com").strip() or "https://open.ys7.com",
+            live_url_path=env.get("EZVIZ_LIVE_URL_PATH", "").strip(),
+            live_source=env.get("EZVIZ_LIVE_SOURCE", "").strip(),
+            manual_live_url=env.get("EZVIZ_MANUAL_LIVE_URL", "").strip(),
+            managed_stream_id=env.get("EZVIZ_MANAGED_STREAM_ID", "").strip(),
+            managed_stream_protocol=parse_int_env("EZVIZ_MANAGED_STREAM_PROTOCOL", 3),
+            managed_stream_quality=parse_int_env("EZVIZ_MANAGED_STREAM_QUALITY", 1),
+            managed_stream_support_h265=parse_int_env("EZVIZ_MANAGED_STREAM_SUPPORT_H265", 1),
+            managed_stream_mute=parse_int_env("EZVIZ_MANAGED_STREAM_MUTE", 0),
+            timeout_seconds=float(env.get("EZVIZ_TIMEOUT_SECONDS", "20").strip() or "20"),
         )
 
     def doctor(self) -> JsonDict:
@@ -143,6 +285,7 @@ class EnvConfig:
             "live_url_path_override": bool(self.live_url_path),
             "live_source_override": bool(self.live_source),
             "manual_live_url_override": bool(self.manual_live_url),
+            "managed_stream_override": bool(self.managed_stream_id),
         }
 
 
@@ -336,6 +479,10 @@ class EzvizClient:
         protocol_id: Optional[int] = None,
         source: Optional[str] = None,
         channel_no: Optional[int] = None,
+        quality: Optional[int] = None,
+        support_h265: Optional[int] = None,
+        mute: Optional[int] = None,
+        address_type: Optional[int] = None,
     ) -> JsonDict:
         if self.config.manual_live_url and channel_no in (None, self.config.channel_no):
             return {
@@ -347,6 +494,14 @@ class EzvizClient:
         params["expireTime"] = expire_seconds
         if protocol_id is not None:
             params["protocol"] = protocol_id
+        if quality is not None:
+            params["quality"] = quality
+        if support_h265 is not None:
+            params["supportH265"] = support_h265
+        if mute is not None:
+            params["mute"] = mute
+        if address_type is not None:
+            params["type"] = address_type
         live_source = first_nonempty(source, self.config.live_source)
         if live_source:
             params["source"] = live_source
@@ -736,6 +891,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("capabilities", help="Show the skill's current control surface.")
     subparsers.add_parser("doctor", help="Show which environment variables are present.")
+    setup_parser = subparsers.add_parser("setup-env", help="Interactive install wizard for writing a local EZVIZ env file.")
+    setup_parser.add_argument("--output", type=Path, default=Path("~/.ezviz_cb60_env"), help="Where to write the local env file.")
+    setup_parser.add_argument("--force", action="store_true", help="Overwrite the target file without asking.")
 
     ptz_parser = subparsers.add_parser("ptz", help="Move the camera left/right or zoom.")
     ptz_parser.add_argument("direction", choices=sorted(EzvizClient.PTZ_COMMANDS.keys()))
@@ -815,10 +973,15 @@ def emit_json(payload: JsonDict) -> None:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+    try:
+        normalized_argv, env_file = extract_env_file_arg(argv)
+    except EzvizError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(normalized_argv)
 
-    config = EnvConfig.from_env()
+    config = EnvConfig.from_env(env_file=env_file)
     client = EzvizClient(config)
 
     if args.command == "capabilities":
@@ -827,6 +990,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     if args.command == "doctor":
         emit_json(config.doctor())
+        return 0
+
+    if args.command == "setup-env":
+        emit_json(run_setup_wizard(output_path=args.output, force=args.force))
         return 0
 
     if args.command == "talk":

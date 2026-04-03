@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -14,7 +16,17 @@ SCRIPT_DIR = (
 )
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from ezviz_cb60_control import EnvConfig, EzvizClient, EzvizError, find_first_url, flatten_battery_signals, join_url  # noqa: E402
+from ezviz_cb60_control import (  # noqa: E402
+    EnvConfig,
+    EzvizClient,
+    EzvizError,
+    extract_env_file_arg,
+    find_first_url,
+    flatten_battery_signals,
+    join_url,
+    run_setup_wizard,
+    write_env_file,
+)
 
 
 class FakeRequester:
@@ -61,6 +73,93 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(signals["deviceStatus.battery"], 78)
         self.assertEqual(signals["deviceStatus.extra.powerState"], "charging")
         self.assertEqual(signals["battryStatus"], 96)
+
+    def test_env_config_can_load_from_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "cam2.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "export EZVIZ_APP_KEY='key-2'",
+                        "export EZVIZ_ACCESS_TOKEN='token-2'",
+                        "export EZVIZ_DEVICE_SERIAL='device-2'",
+                        "export EZVIZ_VALIDATE_CODE='code-2'",
+                        "export EZVIZ_CHANNEL_NO='3'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            old_serial = os.environ.get("EZVIZ_DEVICE_SERIAL")
+            os.environ["EZVIZ_DEVICE_SERIAL"] = "device-1"
+            try:
+                config = EnvConfig.from_env(env_file=str(env_path))
+            finally:
+                if old_serial is None:
+                    os.environ.pop("EZVIZ_DEVICE_SERIAL", None)
+                else:
+                    os.environ["EZVIZ_DEVICE_SERIAL"] = old_serial
+            self.assertEqual(config.app_key, "key-2")
+            self.assertEqual(config.access_token, "token-2")
+            self.assertEqual(config.device_serial, "device-2")
+            self.assertEqual(config.validate_code, "code-2")
+            self.assertEqual(config.channel_no, 3)
+
+    def test_extract_env_file_arg_accepts_inline_and_positional_forms(self):
+        cleaned, env_file = extract_env_file_arg(["capture-shot", "--env-file", "~/.ezviz_cb60_env_cam2", "--foo"])
+        self.assertEqual(cleaned, ["capture-shot", "--foo"])
+        self.assertEqual(env_file, "~/.ezviz_cb60_env_cam2")
+
+        cleaned2, env_file2 = extract_env_file_arg(["--env-file=~/.ezviz_cb60_env_cam1", "doctor"])
+        self.assertEqual(cleaned2, ["doctor"])
+        self.assertEqual(env_file2, "~/.ezviz_cb60_env_cam1")
+
+    def test_write_env_file_writes_expected_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cam.env"
+            write_env_file(
+                path,
+                {
+                    "EZVIZ_APP_KEY": "key",
+                    "EZVIZ_APP_SECRET": "secret",
+                    "EZVIZ_ACCESS_TOKEN": "token",
+                    "EZVIZ_DEVICE_SERIAL": "serial",
+                    "EZVIZ_VALIDATE_CODE": "verify",
+                    "EZVIZ_CHANNEL_NO": "1",
+                },
+            )
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("export EZVIZ_APP_KEY='key'", text)
+            self.assertIn("export EZVIZ_DEVICE_SERIAL='serial'", text)
+
+    def test_run_setup_wizard_creates_env_file(self):
+        answers = iter(
+            [
+                "device-9",
+                "1",
+            ]
+        )
+        secret_answers = iter(
+            [
+                "key-9",
+                "secret-9",
+                "token-9",
+                "verify-9",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "wizard.env"
+            payload = run_setup_wizard(
+                output_path=env_path,
+                force=True,
+                prompt_func=lambda _prompt: next(answers),
+                secret_prompt_func=lambda _prompt: next(secret_answers),
+            )
+            self.assertTrue(env_path.exists())
+            self.assertEqual(payload["env_file"], str(env_path))
+            loaded = EnvConfig.from_env(env_file=str(env_path))
+            self.assertEqual(loaded.app_key, "key-9")
+            self.assertEqual(loaded.device_serial, "device-9")
 
     def test_ptz_pulse_issues_start_and_stop(self):
         requester = FakeRequester(

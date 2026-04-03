@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from ezviz_cb60_control import EnvConfig, EzvizClient, EzvizError
+from ezviz_cb60_control import EnvConfig, EzvizClient, EzvizError, extract_env_file_arg
 
 JsonDict = Dict[str, Any]
 
@@ -414,14 +414,19 @@ def emit_json(payload: JsonDict) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        normalized_argv, env_file = extract_env_file_arg(argv)
+    except EzvizError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(normalized_argv)
 
     if args.command == "run":
         try:
             artifacts = StressArtifacts.create(args.output_root)
             payload = run_stress_test(
-                config=EnvConfig.from_env(),
+                config=EnvConfig.from_env(env_file=env_file),
                 artifacts=artifacts,
                 stream_url=args.stream_url,
                 sample_interval_seconds=args.sample_interval_seconds,

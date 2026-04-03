@@ -21,7 +21,11 @@ The current implementation covers:
 - Preview URL diagnosis
 - Logical channel probing for dual-lens validation
 - Local shot-planning workflow for up to 4 clips
+- Recurring OpenClaw task management for daily capture windows
+- Strict merchant command parsing around the wake word `龙虾`
+- Daily reporting and capture-session logging
 - Auto-convert recorded clips to rotated MP4 when ffmpeg is available
+- Minute-level status monitoring with local logs and report output
 - Capability inspection
 
 The device profile this skill assumes:
@@ -64,12 +68,50 @@ Voice talk is documented but not executed by the portable script yet because the
 
 The controller lives at `scripts/ezviz_cb60_control.py`.
 The local workflow helper lives at `scripts/cb60_capture_workflow.py`.
+The recurring task helper lives at `scripts/cb60_task_manager.py`.
+
+Before running the skill on a new machine, create and load a local environment file such as:
+
+```bash
+python3 scripts/ezviz_cb60_control.py setup-env
+source ~/.ezviz_cb60_env
+```
+
+The setup wizard actively asks for:
+
+- `EZVIZ_APP_KEY`
+- `EZVIZ_APP_SECRET`
+- `EZVIZ_ACCESS_TOKEN`
+- `EZVIZ_DEVICE_SERIAL`
+- `EZVIZ_VALIDATE_CODE`
+- `EZVIZ_CHANNEL_NO`
+
+If an operator wants to prepare a second camera profile on the same machine:
+
+```bash
+python3 scripts/ezviz_cb60_control.py setup-env --output ~/.ezviz_cb60_env_cam2
+source ~/.ezviz_cb60_env_cam2
+```
+
+Manual file creation is still allowed, but the wizard is now the preferred onboarding path.
+
+Do not rely on temporary files under `/tmp` for long-term setup, because they may disappear after cleanup or reboot.
+
+If you need to switch between cameras on the same machine, keep one env file per device and pass it per command:
+
+```bash
+python3 scripts/ezviz_cb60_control.py --env-file ~/.ezviz_cb60_env_cam2 doctor
+python3 scripts/cb60_capture_workflow.py --env-file ~/.ezviz_cb60_env_cam2 capture-shot --session ./artifacts/workflows/<session>/session.json
+```
+
+This keeps the plugin single-device per invocation while still letting the operator switch between multiple cameras without editing code.
 
 Common commands:
 
 ```bash
 python3 scripts/ezviz_cb60_control.py capabilities
 python3 scripts/ezviz_cb60_control.py doctor
+python3 scripts/ezviz_cb60_control.py setup-env
 python3 scripts/ezviz_cb60_control.py device-info
 python3 scripts/ezviz_cb60_control.py device-status
 python3 scripts/ezviz_cb60_control.py battery
@@ -85,6 +127,10 @@ python3 scripts/ezviz_cb60_control.py probe-channels --source <tenant-source> --
 python3 scripts/cb60_capture_workflow.py init-session --brief '门头, 店内全景, 商品近景'
 python3 scripts/cb60_capture_workflow.py next-shot --session ./artifacts/workflows/<session>/session.json
 python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/workflows/<session>/session.json --stream-url '<flv-or-hls-url>' --rotation cw90
+python3 scripts/cb60_task_manager.py init-task --task-root ./artifacts/task-manager/store-a --start-time 11:00 --end-time 12:00 --brief '门头, 店内全景'
+python3 scripts/cb60_task_manager.py merchant-command --task ./artifacts/task-manager/store-a/task.json --text '龙虾，怎么没有拍摄，帮我找找问题'
+python3 scripts/cb60_task_manager.py daily-report --task ./artifacts/task-manager/store-a/task.json --status-root ./artifacts/status-monitor/live
+python3 scripts/cb60_status_monitor.py run --interval-seconds 60 --max-rounds 5
 ```
 
 Run commands from:
@@ -108,11 +154,21 @@ Run commands from:
 13. Use the generated shot order to reduce repositioning. The workflow intentionally groups shots by zone before capture.
 14. After each capture, read the next instruction from `capture-shot` or `next-shot` instead of asking for repeated confirmations.
 15. The workflow now prefers FLV recording when a FLV address is provided, because it has proven more stable than the earlier HLS-only path in real-device validation.
-16. The workflow now tries to auto-convert recorded clips into rotated `.mp4` output when `ffmpeg` is available. The default is `cw90`, which turns a landscape source into portrait output.
-17. If conversion fails or `ffmpeg` is missing, it safely falls back to the original recorded container.
-18. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
-19. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
-20. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
+16. If `EZVIZ_MANAGED_STREAM_ID` is set, the workflow should prefer that long-lived managed stream and fetch a fresh playback address from it instead of creating or assuming a temporary live address.
+17. The workflow now tries to auto-convert recorded clips into rotated `.mp4` output when `ffmpeg` is available. The default is `cw90`, which turns a landscape source into portrait output.
+18. If conversion fails or `ffmpeg` is missing, it safely falls back to the original recorded container.
+19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=4`, `quality=1`, `supportH265=1`, and `type=1` so it requests the same fresh FLV address shape that passed real-device validation.
+20. Every workflow capture should append structured logs to `capture-log.jsonl` and refresh `capture-report.md` inside the session folder.
+21. After each capture, validate the resulting file. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
+22. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
+23. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
+24. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
+25. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
+26. Merchant-side interaction must stay inside the fixed boundary: modify capture time, diagnose capture problems, or stop capture. Reject anything else through `merchant-command`.
+27. After each finished capture session, call `record-session` so the plugin can build a real daily report with clip counts and upload counts.
+28. Use `daily-report` for end-of-day summaries and `diagnose-task` when the merchant says “怎么没有拍摄”.
+29. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
+30. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
 
 ## API Notes
 
