@@ -51,44 +51,40 @@
 - `skills/ezviz-cb60-control/scripts/cb60_status_monitor.py`
   - 设备状态轮询，按固定间隔写本地日志 / CSV / 报告
 
-## 环境变量
+## OpenClaw 需要理解的核心规则
 
-插件只从环境变量读取凭据：
+这套插件不是“只会拍视频”的单点脚本，而是一个完整的商家视频任务插件。  
+OpenClaw 接入时，应该把它理解成下面这 4 层：
 
-- `EZVIZ_APP_KEY`
-- `EZVIZ_APP_SECRET`
-- `EZVIZ_ACCESS_TOKEN`
-- `EZVIZ_DEVICE_SERIAL`
-- `EZVIZ_VALIDATE_CODE`
-- `EZVIZ_CHANNEL_NO`
+1. **设备控制层**
+- 控制摄像头左右转动、抓拍、查状态、查电量、拿直播地址
 
-## 首次安装后的必做配置
+2. **拍摄工作流层**
+- 录视频
+- 自动转竖屏 `MP4`
+- 自动验片
+- 失败自动截帧和分析
 
-把插件下载到一台新电脑后，第一步不是直接跑脚本，而是先把萤石凭据写到本机环境里。
+3. **任务管理层**
+- 每日重复定时任务
+- 商家有限口令边界
+- 临时拍摄模式
+- 开拍前 1 小时电量提醒
+- 日报和问题排查
 
-推荐做法是在当前用户目录创建：
+4. **云上后处理层**
+- 上传火山 TOS
+- LAS 高光剪辑
+- LAS 去水印
+- LAS 变高清
 
-- `~/.ezviz_cb60_env`
+换句话说，如果用户没有特别强调“只测摄像头”，OpenClaw 默认应该按**完整链路**运行，而不是只停在本地录制。
 
-最推荐的方式是直接运行安装向导：
+## 环境变量与安装配置
 
-```bash
-python3 scripts/ezviz_cb60_control.py setup-env
-```
+插件所有敏感配置都从环境变量读取，不会写进代码。
 
-如果是由 OpenClaw 安装插件并接待用户，推荐先执行：
-
-```bash
-python3 scripts/cb60_task_manager.py install-onboarding-message
-```
-
-然后把返回的 `message_text` 原样发给用户，先收集安装所需资料；资料配置完成后，再继续问：
-
-```text
-你希望这个摄像头在什么时候拍？
-```
-
-向导会主动询问这些关键信息：
+### 萤石拍摄必需项
 
 - `EZVIZ_APP_KEY`
 - `EZVIZ_APP_SECRET`
@@ -97,29 +93,95 @@ python3 scripts/cb60_task_manager.py install-onboarding-message
 - `EZVIZ_VALIDATE_CODE`
 - `EZVIZ_CHANNEL_NO`
 
-安装向导还会继续追问：
-
-- 是否现在一起配置 `LAS/TOS` 后处理
-
-如果你选择 `yes`，它还会继续询问：
+### LAS/TOS 完整后处理必需项
 
 - `LAS_API_KEY`
 - `LAS_REGION`
 - `TOS_ACCESS_KEY`
 - `TOS_SECRET_KEY`
-- `TOS_BUCKET`
-- `TOS_PREFIX`
+- `TOS_ORIGINAL`
+- `TOS_FINAL`
 
-这样第一次安装插件时，用户就可以一次性把“拍摄 + LAS/TOS 后处理”都配好。
+### 可选增强项
 
-如果你要给第二台或第三台摄像头单独建环境文件：
+- `LAS_INPAINT_FIXED_BBOXES`
+  - 1000x1000 归一化坐标
+  - 默认已经针对“左下角时间水印”强化
+- `EZVIZ_MANAGED_STREAM_ID`
+  - 如果你们要长期复用某条直播流
+
+### 首次安装后的正确顺序
+
+把插件下载到一台新电脑后，OpenClaw 不应该直接开始问拍摄时间。  
+正确顺序是：
+
+1. 先调用：
 
 ```bash
-python3 scripts/ezviz_cb60_control.py setup-env --output ~/.ezviz_cb60_env_cam2
-source ~/.ezviz_cb60_env_cam2
+python3 scripts/cb60_task_manager.py install-onboarding-message
 ```
 
-如果你更喜欢手工方式，也可以自己创建文件：
+2. 把返回的 `message_text` 原样发给用户，让用户先提供：
+- 萤石凭据
+- LAS/TOS 凭据
+- 商家自己的两个 TOS 文件夹
+
+3. 再执行安装向导：
+
+```bash
+python3 scripts/ezviz_cb60_control.py setup-env
+```
+
+4. 环境配置完成后，OpenClaw 再继续问唯一那句：
+
+```text
+你希望这个摄像头在什么时候拍？
+```
+
+### 安装向导会主动问什么
+
+向导会先问萤石拍摄必需项，然后再问：
+
+- 是否现在一起配置 `LAS/TOS`
+
+如果用户回答 `yes`，它会继续问：
+
+- `LAS_API_KEY`
+- `LAS_REGION`
+- `TOS_ACCESS_KEY`
+- `TOS_SECRET_KEY`
+- `TOS_ORIGINAL`
+- `TOS_FINAL`
+
+也就是说，**安装后 OpenClaw 不需要自己发明第二套问答逻辑**；只要：
+
+- 先发资料采集说明
+- 再跑 `setup-env`
+
+就可以了。
+
+### 推荐环境文件
+
+推荐把配置写到：
+
+- `~/.ezviz_cb60_env`
+
+如果有第二台或第三台设备，继续按这个模式建：
+
+- `~/.ezviz_cb60_env_cam2`
+- `~/.ezviz_cb60_env_cam3`
+
+然后通过 `--env-file` 切换摄像头，而不是改插件代码。
+
+例如：
+
+```bash
+python3 scripts/ezviz_cb60_control.py --env-file ~/.ezviz_cb60_env_cam2 doctor
+python3 scripts/cb60_capture_workflow.py --env-file ~/.ezviz_cb60_env_cam2 capture-shot --session ./artifacts/workflows/<session>/session.json
+python3 scripts/cb60_status_monitor.py --env-file ~/.ezviz_cb60_env_cam2 run --interval-seconds 60 --max-rounds 5
+```
+
+### 手工环境文件模板
 
 ```bash
 cat > ~/.ezviz_cb60_env <<'EOF'
@@ -129,14 +191,14 @@ export EZVIZ_ACCESS_TOKEN='你的_ACCESS_TOKEN'
 export EZVIZ_DEVICE_SERIAL='你的_DEVICE_SERIAL'
 export EZVIZ_VALIDATE_CODE='你的_VALIDATE_CODE'
 export EZVIZ_CHANNEL_NO='1'
+
 export LAS_API_KEY='你的_LAS_API_KEY'
 export LAS_REGION='cn-beijing'
 export TOS_ACCESS_KEY='你的_TOS_ACCESS_KEY'
 export TOS_SECRET_KEY='你的_TOS_SECRET_KEY'
-export TOS_BUCKET='你的_TOS_BUCKET'
-export TOS_PREFIX='tos://你的_TOS_BUCKET/openclaw/camera/'
-export TOS_ORIGINAL='tos://你的_TOS_BUCKET/openclaw/store1_jsspa_original/'
-export TOS_FINAL='tos://你的_TOS_BUCKET/openclaw/store1_jsspa_final/'
+export TOS_ORIGINAL='tos://doudou-video/openclaw/store1_jsspa_original/'
+export TOS_FINAL='tos://doudou-video/openclaw/store1_jsspa_final/'
+
 export LAS_INPAINT_FIXED_BBOXES='[[0,650,150,970]]'
 EOF
 
@@ -144,37 +206,60 @@ chmod 600 ~/.ezviz_cb60_env
 source ~/.ezviz_cb60_env
 ```
 
-建议先检查是否生效：
+验证配置：
 
 ```bash
-echo "$EZVIZ_DEVICE_SERIAL"
 python3 scripts/ezviz_cb60_control.py doctor
 ```
 
-补充说明：
-- `LAS_INPAINT_FIXED_BBOXES` 是可选增强项，格式是 `1000x1000` 归一化坐标。
-- 当前默认值针对“左下角时间水印”做了加强；如果不同机型位置有偏差，可以按实际情况微调。
+## 商家 TOS 目录规则与云上命名
 
-说明：
+商家云上目录不是随便填的，插件默认按这套规则工作：
 
-- 不要把这些值写进代码、测试、README 示例输出或提交记录
-- 不建议继续使用 `/tmp/ezviz.env.shared` 作为长期方案，因为它是临时目录，重启或清理后可能消失
-- 以后每次开一个新的终端会话，如果没有自动加载，就先执行一次 `source ~/.ezviz_cb60_env`
+- 每个商家在 `openclaw/` 下有两个目录
+- 一个放原始视频
+- 一个放最终成片
 
-如果你有多台摄像头，推荐每台设备一个文件，例如：
+例如：
 
-- `~/.ezviz_cb60_env_cam1`
-- `~/.ezviz_cb60_env_cam2`
+- `tos://doudou-video/openclaw/store1_jsspa_original/`
+- `tos://doudou-video/openclaw/store1_jsspa_final/`
 
-插件本身仍然按“单次命令只操作一台设备”的方式工作，但现在支持按次切换目标设备：
+插件会自动从目录名里提取商家标识：
 
-```bash
-python3 scripts/ezviz_cb60_control.py --env-file ~/.ezviz_cb60_env_cam2 doctor
-python3 scripts/cb60_capture_workflow.py --env-file ~/.ezviz_cb60_env_cam2 capture-shot --session ./artifacts/workflows/<session>/session.json
-python3 scripts/cb60_status_monitor.py --env-file ~/.ezviz_cb60_env_cam2 run --interval-seconds 60 --max-rounds 5
-```
+- `store1_jsspa`
 
-这样你在同一个插件里就能切到不同摄像头，不需要改插件代码，也不需要反复手工 `source`。
+然后按固定格式命名云上文件：
+
+- 原始视频：
+  - `store1_jsspa_YYYYMMDD_HHMMSS_original_01.mp4`
+- 最终成片：
+  - `store1_jsspa_YYYYMMDD_HHMMSS_final_01.mp4`
+
+例如：
+
+- `store1_jsspa_20260415_123306_original_01.mp4`
+- `store1_jsspa_20260415_123306_final_01.mp4`
+
+这个命名已经写死在插件里，OpenClaw 不需要自己拼名字。
+
+## OpenClaw 标准接入流程
+
+推荐把插件接成这条固定链路：
+
+1. 插件安装完成
+2. 调 `install-onboarding-message`
+3. 把 `message_text` 发给用户，收齐配置
+4. 跑 `setup-env`
+5. 再问：
+   - `你希望这个摄像头在什么时候拍？`
+6. 用 `first-boot-setup` 创建每日重复任务
+7. 日常由 OpenClaw 周期执行：
+   - `battery-precheck`
+   - `should-run-now`
+   - `capture workflow`
+   - `record-session`
+   - `daily-report`
 
 ## 常用命令
 
@@ -207,7 +292,7 @@ python3 scripts/cb60_status_monitor.py run --interval-seconds 60 --max-rounds 5
   - `3=flv`
 - 为了兼容旧调用，CLI 里如果传了 `4`，也会自动按 `flv` 处理
 
-## 本地拍摄工作流
+## 视频拍摄工作流
 
 ```bash
 python3 scripts/cb60_capture_workflow.py init-session --brief '门头, 店内全景, 商品近景'
@@ -227,34 +312,63 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
 8. 如果既没有显式传 `--stream-url`，也没有配置长期 `streamId`，工作流会默认按 `protocol=4 + quality=1 + supportH265=1 + type=1` 现取最新 `FLV` 地址
 9. 每次执行都会在 session 目录里写 `capture-log.jsonl` 和 `capture-report.md`
 10. 录后会自动验片；失败或异常时会自动截一帧，并补失败分析说明
-11. 验片通过后，session 会自动生成一条 LAS 后处理流水线状态，固定顺序为：
+11. 验片通过后，会自动进入 LAS 后处理流水线，固定顺序为：
     - 上传到火山 TOS
     - LAS 高光剪辑
     - LAS 去水印
     - LAS 变高清
-12. 由于当前仓库还没有接入你的 TOS 上传访问，这条 LAS 流水线会先标记成 `pending_config`，但状态和后续顺序已经写进 `session.json`、`capture-log.jsonl`、`capture-report.md`
+12. 本地文件和云上文件都会带拍摄时间戳
 
-### LAS 后处理说明
+### LAS 后处理固定策略
 
-OpenClaw 录完本地视频后的目标链路已经固定为：
+只要配置齐了 LAS/TOS，插件默认就会在每条验片通过的视频后自动执行：
 
-1. 先把本地视频传到火山 TOS
-2. 调用 `byted-las-video-edit` 做高光剪辑
-3. 调用 `byted-las-video-inpaint` 做去水印
-4. 调用 `byted-las-video-resize` 做变高清
+1. **上传 TOS**
+2. **LAS 高光剪辑**
+3. **LAS 去水印**
+4. **LAS 变高清**
 
-当前版本先保留这条编排逻辑，不会擅自发起云端上传。原因是还缺少你后面要提供的 TOS 访问配置。
+默认策略已经固化：
 
-所以你现在会在每条拍摄结果里看到一段 `postprocess` 状态：
+#### 高光剪辑
+- 识别营业高光动态画面
+- 剔除静态空镜、无人物、无动作、无画面变化的无效内容
+- 重点保留：
+  - 上菜全过程
+  - 后厨食材处理
+  - 前台接待 / 操作
+  - 人员走动互动
+  - 餐具摆放等营业相关动态
 
-- `accepted` 片段：LAS 流水线状态会是 `pending_config`
-- `abnormal/failed` 片段：LAS 流水线状态会是 `skipped_capture_not_accepted`
+#### 去水印
+- 目标：全部可见水印
+- 默认开启精细检测
+- 对左下角时间水印增加固定框强化
+- 当前默认固定框：
 
-这保证了：
+```bash
+export LAS_INPAINT_FIXED_BBOXES='[[0,650,150,970]]'
+```
 
-- 本地拍摄主流程不受影响
-- OpenClaw 已经知道后面该按什么顺序调 LAS
-- 等你补了 TOS 访问后，不需要再重构录制工作流
+#### 变高清
+- 默认输出 **2K 规格竖屏视频**
+
+### 本地与云上产物
+
+每次拍摄后通常会有这些文件：
+
+本地：
+- 原始流文件 `.flv` 或 `.ts`
+- 旋转后的 `.mp4`
+- `capture-log.jsonl`
+- `capture-report.md`
+- 失败时的截帧图片
+
+云上：
+- 原始上传视频
+- LAS 高光剪辑中间视频
+- LAS 去水印中间视频
+- 最终高清成片
 
 ## OpenClaw 视频拍摄任务流程
 
@@ -263,8 +377,9 @@ OpenClaw 录完本地视频后的目标链路已经固定为：
 - 后台负责下发拍摄任务与每日时间窗口
 - OpenClaw 负责在时间窗口内执行拍摄工作流
 - 首次开机时，商家只需要回答一个问题：`你希望这个摄像头在什么时候拍？`
-- 商家只允许通过唤醒词 `龙虾` 执行三类操作：
+- 商家只允许通过唤醒词 `龙虾` 执行四类操作：
   - 修改拍摄时间
+  - 临时拍摄
   - 排查拍摄问题
   - 停止拍摄
 
@@ -387,6 +502,7 @@ OpenClaw 在运行 `should-run-now` 时，现在要同时判断两件事：
 - 去水印：
   - 默认去掉全部可见水印
   - 默认使用精细检测
+  - 默认强化左下角时间水印区域
 - 变高清：
   - 默认输出 2K 规格竖屏视频
 
@@ -541,6 +657,45 @@ python3 scripts/cb60_task_manager.py daily-report \
 5. 状态轮询单独常驻运行
 6. 日终或商家追问时，用 `daily-report` 和 `diagnose-task` 输出汇总
 
+## OpenClaw 调用时的判断规则
+
+为了让 OpenClaw 不误解这套插件，建议固定按下面这些规则理解：
+
+1. **默认是完整链路**
+- 如果没有特别强调“只拍摄不走后处理”，就默认：
+  - 拍摄
+  - 本地 MP4
+  - 上传 TOS
+  - LAS 高光剪辑
+  - LAS 去水印
+  - LAS 变高清
+
+2. **每日任务是长期任务**
+- 首次说一次拍摄时间后，后面每天都重复执行
+- 除非商家明确说：
+  - `龙虾，停止拍摄`
+
+3. **临时拍摄不会覆盖每日任务**
+- 商家临时要求“现在拍”，只是额外加一个临时拍摄窗口
+- 原来的每日任务照常存在
+
+4. **多摄像头通过 env-file 切换**
+- 不是一个任务里同时操作多台
+- 而是一次命令只操作当前环境中的一台设备
+
+5. **云上文件命名不用 OpenClaw 自己拼**
+- 插件会自动按商家 TOS 目录推导商家名
+- 自动生成 `original/final` 文件名
+
+6. **日志和报告是默认产物**
+- 本地拍摄日志
+- 本地拍摄报告
+- 任务事件日志
+- 每日报告
+- 状态轮询日志
+
+OpenClaw 不需要自己再重复造一套日志结构。
+
 ## 设备状态轮询
 
 推荐默认值：
@@ -581,14 +736,14 @@ python3 scripts/cb60_status_monitor.py run --interval-seconds 60 --output-root .
 
 - [minimal-server-architecture.md](/Users/bytedance/Documents/Playground/working/openclaw-plugins/ezviz-cb60-control/skills/ezviz-cb60-control/references/minimal-server-architecture.md)
 
-## 测试状态
+## 当前测试状态
 
-当前本地测试状态：
-
-- `61/61` 通过
-
-运行命令：
+当前最近一轮本地相关回归：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m unittest tests.test_cb60_task_manager tests.test_cb60_capture_workflow tests.test_cb60_interval_capture_test tests.test_ezviz_cb60_control
 ```
+
+结果：
+
+- `77/77` 通过
