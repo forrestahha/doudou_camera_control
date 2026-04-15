@@ -15,10 +15,151 @@ from ezviz_cb60_control import EnvConfig, EzvizClient, EzvizError, extract_env_f
 
 JsonDict = Dict[str, Any]
 TIME_RANGE_SEPARATORS = r"(?:-|到|至|~|—|－)"
+DEFAULT_BATTERY_REMINDER_THRESHOLD = 85
+DEFAULT_PRECHECK_LEAD_MINUTES = 60
+DEFAULT_CUSTOM_CAPTURE_INTERVAL_MINUTES = 10
+DEFAULT_CUSTOM_CLIP_DURATION_SECONDS = 20
 
 
 def emit_json(payload: JsonDict) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def workflow_spec() -> JsonDict:
+    return {
+        "plugin_contract": {
+            "mode": "recurring_daily_capture",
+            "default_repeat_policy": "首次配置一次后，每日按相同时间窗口重复执行，直到商家明确说“停止拍摄”或后台停用任务。",
+            "camera_scope": "单次任务绑定当前环境里的单台摄像头；多摄像头通过不同 env-file 切换。",
+        },
+        "installation_onboarding": {
+            "send_message_after_install": True,
+            "next_step_after_requirements": "收齐安装信息后，再向商家追问“你希望这个摄像头在什么时候拍？”。",
+        },
+        "merchant_onboarding": {
+            "first_question": "你希望这个摄像头在什么时候拍？",
+            "accepted_answer_format": [
+                "11:00-12:00",
+                "11点到12点",
+                "上午11点到12点",
+            ],
+            "first_boot_action": "收到时间段后，立即创建每日重复定时任务。",
+        },
+        "merchant_command_rules": {
+            "wake_word": "龙虾",
+            "allowed_commands": [
+                {
+                    "intent": "set_capture_time",
+                    "example": "龙虾，帮我改一下拍摄时间 11:00-12:00",
+                    "effect": "更新每日重复拍摄时间窗口。",
+                },
+                {
+                    "intent": "start_custom_capture",
+                    "example": "龙虾，从现在开始拍视频，每10分钟拍一次，拍到22:00",
+                    "effect": "立即开启临时拍摄模式，但不会修改原有的每日定时任务。",
+                },
+                {
+                    "intent": "diagnose_capture_problem",
+                    "example": "龙虾，怎么没有拍摄，帮我找找问题",
+                    "effect": "排查任务状态、设备状态、电量和最近一次拍摄结果。",
+                },
+                {
+                    "intent": "stop_capture",
+                    "example": "龙虾，停止拍摄",
+                    "effect": "停止后续每日自动拍摄。",
+                },
+            ],
+            "forbidden_scope": "除修改拍摄时间、排查拍摄问题、停止拍摄外，商家无其他交互权限。",
+        },
+        "custom_capture_rules": {
+            "mode": "custom_capture_window",
+            "trigger_examples": [
+                "龙虾，从现在开始拍视频，每10分钟拍一次，拍到22:00",
+                "龙虾，帮我拍视频，每15分钟拍一次，拍到21点30",
+            ],
+            "required_parameters": [
+                "拍摄间隔",
+                "结束时间",
+            ],
+            "default_clip_duration_seconds": DEFAULT_CUSTOM_CLIP_DURATION_SECONDS,
+            "coexist_with_recurring_daily_schedule": True,
+        },
+        "scheduler_rules": {
+            "before_window": [
+                "在下一次拍摄开始前 60 分钟执行一次 battery-precheck。",
+                f"如果电量低于 {DEFAULT_BATTERY_REMINDER_THRESHOLD}% ，提醒商家充电。",
+            ],
+            "inside_window": [
+                "进入拍摄时间窗口后，OpenClaw 通过 should-run-now 判断是否执行。",
+                "如果任务 active=true 且当前时间落在每日定时窗口或临时拍摄窗口内，则开始拍摄工作流。",
+            ],
+            "after_capture": [
+                "每次会话结束后调用 record-session 写任务日志。",
+                "日报通过 daily-report 汇总拍摄片段数、上传成功数和设备状态。",
+            ],
+        },
+        "capture_command_rules": {
+            "default_live_chain": {
+                "protocol": 4,
+                "quality": 1,
+                "supportH265": 1,
+                "type": 1,
+            },
+            "workflow_defaults": [
+                "录后自动转竖屏 MP4。",
+                "录后自动验片。",
+                "失败或异常时自动截帧并补图像分析。",
+                "验片通过后自动进入 LAS 顺序：高光剪辑 -> 去水印 -> 变高清。",
+            ],
+        },
+        "recommended_openclaw_sequence": [
+            "首次安装后运行 setup-env。",
+            "首次和商家只对话一次，获取每日拍摄时间段。",
+            "如果商家临时说“帮我拍视频”，则改走自定义模式：补齐拍摄间隔和结束时间。",
+            "调用 first-boot-setup 创建 task.json。",
+            "每天定时前 1 小时运行 battery-precheck。",
+            "到达时间窗口时运行 should-run-now。",
+            "如果 should_run_now=true，则执行拍摄工作流。",
+            "拍完后调用 record-session。",
+            "按天调用 daily-report 生成设备运行日报。",
+        ],
+    }
+
+
+def build_install_onboarding_message() -> JsonDict:
+    text = (
+        "为了完成首次安装，请先把下面这些信息准备好发给我：\n"
+        "1. 萤石摄像头信息：AppKey、AppSecret、AccessToken、设备序列号、设备验证码、通道号（默认 1）。\n"
+        "2. 火山云 LAS/TOS 信息：LAS_API_KEY、LAS_REGION、TOS_ACCESS_KEY、TOS_SECRET_KEY。\n"
+        "3. 商家自己的两个 TOS 目录：\n"
+        "   - TOS_ORIGINAL，例如 tos://doudou-video/openclaw/store1_jsspa_original/\n"
+        "   - TOS_FINAL，例如 tos://doudou-video/openclaw/store1_jsspa_final/\n"
+        "4. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
+        "后续插件会按这个时间段每日自动重复拍摄，直到你明确说“停止拍摄”。"
+    )
+    return {
+        "send_after_install": True,
+        "message_text": text,
+        "required_fields": [
+            "EZVIZ_APP_KEY",
+            "EZVIZ_APP_SECRET",
+            "EZVIZ_ACCESS_TOKEN",
+            "EZVIZ_DEVICE_SERIAL",
+            "EZVIZ_VALIDATE_CODE",
+            "EZVIZ_CHANNEL_NO",
+            "LAS_API_KEY",
+            "LAS_REGION",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_ORIGINAL",
+            "TOS_FINAL",
+        ],
+        "merchant_examples": {
+            "tos_original": "tos://doudou-video/openclaw/store1_jsspa_original/",
+            "tos_final": "tos://doudou-video/openclaw/store1_jsspa_final/",
+        },
+        "next_question": "你希望这个摄像头在什么时候拍？",
+    }
 
 
 def now_text(now_ts: Optional[float] = None) -> str:
@@ -96,6 +237,54 @@ def extract_time_window(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def extract_single_time(text: str) -> Optional[str]:
+    colon_matches = re.findall(r"(\d{1,2}:\d{2})", text)
+    if colon_matches:
+        hour, minute = parse_hhmm(colon_matches[-1])
+        return normalize_hhmm(hour, minute)
+
+    chinese_matches = re.findall(r"(\d{1,2})点(?:(\d{1,2})分?)?", text)
+    if chinese_matches:
+        hour_text, minute_text = chinese_matches[-1]
+        hour = int(hour_text)
+        minute = int(minute_text or 0)
+        return normalize_hhmm(hour, minute)
+    return None
+
+
+def extract_interval_minutes(text: str) -> Optional[int]:
+    patterns = [
+        r"每隔\s*(\d{1,3})\s*分钟",
+        r"每\s*(\d{1,3})\s*分钟(?:拍|录)",
+        r"间隔\s*(\d{1,3})\s*分钟",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            minutes = int(match.group(1))
+            if minutes <= 0:
+                raise EzvizError("临时拍摄间隔必须大于 0 分钟。")
+            return minutes
+    return None
+
+
+def extract_clip_duration_seconds(text: str) -> Optional[int]:
+    second_match = re.search(r"拍\s*(\d{1,4})\s*秒", text)
+    if second_match:
+        seconds = int(second_match.group(1))
+        if seconds <= 0:
+            raise EzvizError("单条视频时长必须大于 0 秒。")
+        return seconds
+
+    minute_match = re.search(r"拍\s*(\d{1,3})\s*分钟", text)
+    if minute_match:
+        minutes = int(minute_match.group(1))
+        if minutes <= 0:
+            raise EzvizError("单条视频时长必须大于 0 秒。")
+        return minutes * 60
+    return None
+
+
 def create_task_id() -> str:
     return time.strftime("task-%Y%m%d-%H%M%S")
 
@@ -140,6 +329,8 @@ def init_task(
     wake_word: str = "龙虾",
     max_shots: int = 4,
     merchant_daily_summary: bool = True,
+    battery_reminder_threshold: int = DEFAULT_BATTERY_REMINDER_THRESHOLD,
+    precheck_lead_minutes: int = DEFAULT_PRECHECK_LEAD_MINUTES,
 ) -> JsonDict:
     schedule_start, schedule_end = validate_time_window(start_time, end_time)
     task_root.mkdir(parents=True, exist_ok=True)
@@ -154,6 +345,7 @@ def init_task(
         "merchant_rules": {
             "allowed_actions": [
                 "set_capture_time",
+                "start_custom_capture",
                 "diagnose_capture_problem",
                 "stop_capture",
             ],
@@ -169,6 +361,14 @@ def init_task(
             "brief": brief,
             "max_shots": max(1, min(max_shots, 4)),
         },
+        "custom_capture": {
+            "active": False,
+            "start_at": None,
+            "end_at": None,
+            "interval_minutes": DEFAULT_CUSTOM_CAPTURE_INTERVAL_MINUTES,
+            "clip_duration_seconds": DEFAULT_CUSTOM_CLIP_DURATION_SECONDS,
+            "source_command": None,
+        },
         "status": {
             "active": True,
             "stopped_at": None,
@@ -176,6 +376,10 @@ def init_task(
         },
         "reporting": {
             "merchant_daily_summary": merchant_daily_summary,
+        },
+        "reminders": {
+            "battery_threshold_percent": battery_reminder_threshold,
+            "precheck_lead_minutes": precheck_lead_minutes,
         },
         "artifacts": paths,
     }
@@ -194,6 +398,53 @@ def init_task(
     return task
 
 
+def first_boot_setup(
+    *,
+    task_root: Path,
+    time_window_text: str,
+    brief: str = "自动拍摄任务",
+    task_name: str = "OpenClaw 视频拍摄任务",
+    wake_word: str = "龙虾",
+    max_shots: int = 4,
+) -> JsonDict:
+    window = extract_time_window(time_window_text)
+    if not window:
+        raise EzvizError("首次开机配置失败，未识别到拍摄时间段，请提供类似 11:00-12:00 的时间窗口。")
+    return init_task(
+        task_root=task_root,
+        start_time=window[0],
+        end_time=window[1],
+        brief=brief,
+        task_name=task_name,
+        wake_word=wake_word,
+        max_shots=max_shots,
+    )
+
+
+def custom_capture_is_due(task: JsonDict, now_ts: Optional[float] = None) -> bool:
+    if not task["status"]["active"]:
+        return False
+    custom = task.get("custom_capture") or {}
+    if not custom.get("active"):
+        return False
+    start_at = custom.get("start_at")
+    end_at = custom.get("end_at")
+    if not start_at or not end_at:
+        return False
+    current_ts = now_ts or time.time()
+    start_ts = time.mktime(time.strptime(start_at, "%Y-%m-%d %H:%M:%S"))
+    end_ts = time.mktime(time.strptime(end_at, "%Y-%m-%d %H:%M:%S"))
+    return start_ts <= current_ts < end_ts
+
+
+def current_capture_mode(task: JsonDict, now_ts: Optional[float] = None) -> str:
+    if custom_capture_is_due(task, now_ts):
+        return "custom_capture"
+    if task_is_due(task, now_ts):
+        return "recurring_daily"
+    return "idle"
+
+
 def task_is_due(task: JsonDict, now_ts: Optional[float] = None) -> bool:
     if not task["status"]["active"]:
         return False
@@ -204,6 +455,93 @@ def task_is_due(task: JsonDict, now_ts: Optional[float] = None) -> bool:
     start_value = start_hour * 60 + start_minute
     end_value = end_hour * 60 + end_minute
     return start_value <= current < end_value
+
+
+def should_run_now(task: JsonDict, now_ts: Optional[float] = None) -> JsonDict:
+    mode = current_capture_mode(task, now_ts)
+    due = mode != "idle"
+    payload: JsonDict = {
+        "task_id": task["task_id"],
+        "should_run_now": due,
+        "active": task["status"]["active"],
+        "mode": mode,
+    }
+    if mode == "custom_capture":
+        payload["custom_capture"] = task.get("custom_capture", {})
+    else:
+        payload["schedule"] = task["schedule"]
+    payload["schedule_hint"] = build_schedule_hint(task, now_ts)
+    return payload
+
+
+def next_capture_start_ts(task: JsonDict, now_ts: Optional[float] = None) -> float:
+    base_ts = now_ts or time.time()
+    local = time.localtime(base_ts)
+    start_hour, start_minute = parse_hhmm(task["schedule"]["start_time"])
+    target = time.struct_time(
+        (
+            local.tm_year,
+            local.tm_mon,
+            local.tm_mday,
+            start_hour,
+            start_minute,
+            0,
+            local.tm_wday,
+            local.tm_yday,
+            local.tm_isdst,
+        )
+    )
+    target_ts = time.mktime(target)
+    if target_ts <= base_ts:
+        target_ts += 24 * 3600
+    return target_ts
+
+
+def should_run_battery_precheck(task: JsonDict, now_ts: Optional[float] = None) -> bool:
+    if not task["status"]["active"]:
+        return False
+    lead_minutes = int(task.get("reminders", {}).get("precheck_lead_minutes", DEFAULT_PRECHECK_LEAD_MINUTES) or DEFAULT_PRECHECK_LEAD_MINUTES)
+    next_start = next_capture_start_ts(task, now_ts)
+    remaining = next_start - (now_ts or time.time())
+    return 0 <= remaining <= lead_minutes * 60
+
+
+def battery_precheck(
+    task_path: Path,
+    *,
+    env_file: Optional[str] = None,
+    now_ts: Optional[float] = None,
+    client_factory: Callable[[EnvConfig], EzvizClient] = EzvizClient,
+) -> JsonDict:
+    task = load_task(task_path)
+    next_start_ts = next_capture_start_ts(task, now_ts)
+    should_check = should_run_battery_precheck(task, now_ts)
+    threshold = int(task.get("reminders", {}).get("battery_threshold_percent", DEFAULT_BATTERY_REMINDER_THRESHOLD) or DEFAULT_BATTERY_REMINDER_THRESHOLD)
+
+    config = EnvConfig.from_env(env_file=env_file)
+    client = client_factory(config)
+    dump = client.dump_device()
+    battery_percent = dump.get("battery", {}).get("battery_percent")
+
+    needs_charge = isinstance(battery_percent, (int, float)) and battery_percent < threshold
+    reminder_message = None
+    if needs_charge:
+        reminder_message = f"摄像头当前电量 {battery_percent}%，低于 {threshold}%，请商家在下次拍摄前充电。"
+    elif should_check:
+        reminder_message = f"摄像头当前电量 {battery_percent}%，高于 {threshold}%，下次拍摄前无需提醒充电。"
+
+    payload = {
+        "task_id": task["task_id"],
+        "should_check_now": should_check,
+        "next_capture_start": now_text(next_start_ts),
+        "battery_threshold_percent": threshold,
+        "battery_percent": battery_percent,
+        "needs_charge_reminder": needs_charge,
+        "reminder_message": reminder_message,
+        "device_snapshot": dump,
+    }
+    append_task_event(task, "battery_precheck", payload, now_ts=now_ts)
+    return payload
 
 
 def next_window_text(task: JsonDict) -> str:
@@ -241,6 +579,8 @@ def stop_task(task_path: Path, *, source: str, reason: str) -> JsonDict:
     task["status"]["active"] = False
     task["status"]["stopped_at"] = now_text()
     task["status"]["stop_reason"] = reason
+    task.setdefault("custom_capture", {})
+    task["custom_capture"]["active"] = False
     save_task(task_path, task)
     append_task_event(
         task,
@@ -266,6 +606,69 @@ def resume_task(task_path: Path, *, source: str, reason: str) -> JsonDict:
             "source": source,
             "reason": reason,
         },
+    )
+    return task
+
+
+def set_custom_capture(
+    task_path: Path,
+    *,
+    start_at_ts: float,
+    end_time: str,
+    interval_minutes: int,
+    clip_duration_seconds: int,
+    source: str,
+    raw_command: Optional[str] = None,
+) -> JsonDict:
+    if interval_minutes <= 0:
+        raise EzvizError("临时拍摄间隔必须大于 0 分钟。")
+    if clip_duration_seconds <= 0:
+        raise EzvizError("单条视频时长必须大于 0 秒。")
+
+    task = load_task(task_path)
+    local = time.localtime(start_at_ts)
+    end_hour, end_minute = parse_hhmm(end_time)
+    end_struct = time.struct_time(
+        (
+            local.tm_year,
+            local.tm_mon,
+            local.tm_mday,
+            end_hour,
+            end_minute,
+            0,
+            local.tm_wday,
+            local.tm_yday,
+            local.tm_isdst,
+        )
+    )
+    end_ts = time.mktime(end_struct)
+    if end_ts <= start_at_ts:
+        raise EzvizError("临时拍摄结束时间必须晚于当前时间，请直接说今天拍到几点，例如 22:00。")
+
+    task.setdefault("custom_capture", {})
+    task["custom_capture"].update(
+        {
+            "active": True,
+            "start_at": now_text(start_at_ts),
+            "end_at": now_text(end_ts),
+            "interval_minutes": interval_minutes,
+            "clip_duration_seconds": clip_duration_seconds,
+            "source_command": raw_command,
+        }
+    )
+    save_task(task_path, task)
+    append_task_event(
+        task,
+        "custom_capture_started",
+        {
+            "source": source,
+            "raw_command": raw_command,
+            "start_at": task["custom_capture"]["start_at"],
+            "end_at": task["custom_capture"]["end_at"],
+            "interval_minutes": interval_minutes,
+            "clip_duration_seconds": clip_duration_seconds,
+        },
+        now_ts=start_at_ts,
     )
     return task
 
@@ -299,6 +702,37 @@ def parse_merchant_command(text: str, wake_word: str = "龙虾") -> JsonDict:
             "intent": "set_capture_time",
             "start_time": window[0],
             "end_time": window[1],
+        }
+
+    if any(keyword in normalized for keyword in ("帮我拍视频", "现在拍视频", "从现在开始拍视频", "拍多久的视频", "开始拍视频")):
+        interval_minutes = extract_interval_minutes(normalized)
+        clip_duration_seconds = extract_clip_duration_seconds(normalized) or DEFAULT_CUSTOM_CLIP_DURATION_SECONDS
+        end_time = extract_single_time(normalized)
+        missing: List[str] = []
+        if interval_minutes is None:
+            missing.append("interval_minutes")
+        if end_time is None:
+            missing.append("end_time")
+        if missing:
+            response_parts = ["已识别到临时拍摄请求。"]
+            if "interval_minutes" in missing:
+                response_parts.append("请补充每隔多久拍一条。")
+            if "end_time" in missing:
+                response_parts.append("再告诉我要拍到几点，小豆电量有限。")
+            response_parts.append("例如：龙虾，从现在开始拍视频，每10分钟拍一次，拍到22:00。")
+            return {
+                "recognized": True,
+                "intent": "start_custom_capture",
+                "missing": missing,
+                "clip_duration_seconds": clip_duration_seconds,
+                "response": "".join(response_parts),
+            }
+        return {
+            "recognized": True,
+            "intent": "start_custom_capture",
+            "interval_minutes": interval_minutes,
+            "clip_duration_seconds": clip_duration_seconds,
+            "end_time": end_time,
         }
 
     if any(keyword in normalized for keyword in ("怎么没有拍摄", "排查拍摄问题", "找找问题", "帮我找问题", "帮我排查")):
@@ -476,10 +910,22 @@ def daily_report(task_path: Path, *, report_date: Optional[str] = None, status_r
 
 
 def build_schedule_hint(task: JsonDict, now_ts: Optional[float]) -> str:
+    if custom_capture_is_due(task, now_ts):
+        custom = task.get("custom_capture", {})
+        return "当前在临时拍摄窗口内，计划拍到 {end_at}，每 {interval} 分钟拍一条。".format(
+            end_at=custom.get("end_at", "unknown"),
+            interval=custom.get("interval_minutes", DEFAULT_CUSTOM_CAPTURE_INTERVAL_MINUTES),
+        )
     if task_is_due(task, now_ts):
         return "当前在拍摄时间窗口内。"
     if not task["status"]["active"]:
         return "当前任务已停止，不会自动执行拍摄。"
+    custom = task.get("custom_capture") or {}
+    if custom.get("active") and custom.get("end_at"):
+        return "当前不在临时拍摄窗口内；每日自动拍摄窗口是 {daily}，最近一次临时拍摄计划截止到 {end_at}。".format(
+            daily=next_window_text(task),
+            end_at=custom["end_at"],
+        )
     return f"当前不在拍摄窗口内，下一次自动拍摄窗口是每日 {next_window_text(task)}。"
 
 
@@ -590,6 +1036,30 @@ def merchant_command(task_path: Path, text: str, *, env_file: Optional[str] = No
             "response": "已停止自动拍摄。后续如需恢复，请由后台或运维重新开启任务。",
         }
 
+    if intent == "start_custom_capture":
+        if parsed.get("missing"):
+            return parsed
+        updated_task = set_custom_capture(
+            task_path,
+            start_at_ts=time.time(),
+            end_time=parsed["end_time"],
+            interval_minutes=int(parsed["interval_minutes"]),
+            clip_duration_seconds=int(parsed["clip_duration_seconds"]),
+            source="merchant_command",
+            raw_command=text,
+        )
+        custom = updated_task["custom_capture"]
+        return {
+            "recognized": True,
+            "intent": intent,
+            "custom_capture": custom,
+            "response": "已开启临时拍摄：从现在开始，到 {end_at} 结束，每 {interval} 分钟拍一条，每条 {duration} 秒。原来的每日定时任务保持不变。".format(
+                end_at=custom["end_at"],
+                interval=custom["interval_minutes"],
+                duration=custom["clip_duration_seconds"],
+            ),
+        }
+
     if intent == "diagnose_capture_problem":
         diagnosis = diagnose_task(task_path, env_file=env_file)
         return {
@@ -618,6 +1088,14 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--task-name", default="OpenClaw 视频拍摄任务")
     init_parser.add_argument("--wake-word", default="龙虾")
     init_parser.add_argument("--max-shots", type=int, default=4)
+
+    first_boot_parser = subparsers.add_parser("first-boot-setup", help="首次开机时，只根据商家提供的拍摄时间段创建每日定时任务。")
+    first_boot_parser.add_argument("--task-root", type=Path, required=True)
+    first_boot_parser.add_argument("--time-window-text", required=True, help="商家口述的时间窗口，例如 11:00-12:00。")
+    first_boot_parser.add_argument("--brief", default="自动拍摄任务")
+    first_boot_parser.add_argument("--task-name", default="OpenClaw 视频拍摄任务")
+    first_boot_parser.add_argument("--wake-word", default="龙虾")
+    first_boot_parser.add_argument("--max-shots", type=int, default=4)
 
     status_parser = subparsers.add_parser("task-status", help="Show current task status and schedule.")
     status_parser.add_argument("--task", type=Path, required=True, help="Path to task.json.")
@@ -661,6 +1139,12 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose_parser = subparsers.add_parser("diagnose-task", help="Diagnose why scheduled capture may not be happening.")
     diagnose_parser.add_argument("--task", type=Path, required=True)
 
+    precheck_parser = subparsers.add_parser("battery-precheck", help="在下次拍摄前一个固定提前量内检查设备电量，并判断是否需要提醒商家充电。")
+    precheck_parser.add_argument("--task", type=Path, required=True)
+
+    subparsers.add_parser("install-onboarding-message", help="输出安装完成后，OpenClaw 应自动发送给用户的资料采集说明。")
+    subparsers.add_parser("workflow-spec", help="输出固定的视频命令规则、商家交互边界和每日定时任务约定。")
+
     return parser
 
 
@@ -693,6 +1177,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
 
+        if args.command == "first-boot-setup":
+            task = first_boot_setup(
+                task_root=args.task_root,
+                time_window_text=args.time_window_text,
+                brief=args.brief,
+                task_name=args.task_name,
+                wake_word=args.wake_word,
+                max_shots=args.max_shots,
+            )
+            emit_json(
+                {
+                    "task_path": task["artifacts"]["config_path"],
+                    "events_path": task["artifacts"]["events_path"],
+                    "schedule": task["schedule"],
+                    "response": f"已记录商家拍摄时间 {task['schedule']['start_time']}-{task['schedule']['end_time']}，后续会按天自动执行。",
+                }
+            )
+            return 0
+
         if args.command == "task-status":
             task = load_task(args.task)
             emit_json(
@@ -701,8 +1204,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "task_name": task["task_name"],
                     "status": task["status"],
                     "schedule": task["schedule"],
-                    "should_run_now": task_is_due(task),
-                    "schedule_hint": build_schedule_hint(task, None),
+                    "custom_capture": task.get("custom_capture", {}),
+                    **should_run_now(task),
                 }
             )
             return 0
@@ -729,14 +1232,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.command == "should-run-now":
             task = load_task(args.task)
-            emit_json(
-                {
-                    "task_id": task["task_id"],
-                    "should_run_now": task_is_due(task),
-                    "schedule_hint": build_schedule_hint(task, None),
-                    "active": task["status"]["active"],
-                }
-            )
+            emit_json(should_run_now(task))
             return 0
 
         if args.command == "merchant-command":
@@ -762,6 +1258,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.command == "diagnose-task":
             emit_json(diagnose_task(args.task, env_file=env_file))
+            return 0
+
+        if args.command == "battery-precheck":
+            emit_json(battery_precheck(args.task, env_file=env_file))
+            return 0
+
+        if args.command == "install-onboarding-message":
+            emit_json(build_install_onboarding_message())
+            return 0
+
+        if args.command == "workflow-spec":
+            emit_json(workflow_spec())
             return 0
     except EzvizError as exc:
         print(str(exc), file=sys.stderr)

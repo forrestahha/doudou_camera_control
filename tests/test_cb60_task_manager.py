@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT_DIR = (
@@ -16,16 +17,25 @@ SCRIPT_DIR = (
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from cb60_task_manager import (  # noqa: E402
+    battery_precheck,
+    build_install_onboarding_message,
+    current_capture_mode,
+    custom_capture_is_due,
     daily_report,
     diagnose_task,
+    first_boot_setup,
     init_task,
     load_task,
     merchant_command,
+    next_capture_start_ts,
     parse_merchant_command,
     record_session_result,
     set_schedule,
+    should_run_battery_precheck,
+    should_run_now,
     task_is_due,
     today_text,
+    workflow_spec,
 )
 
 
@@ -68,6 +78,17 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual(task["schedule"]["start_time"], "11:00")
             self.assertTrue(Path(task["artifacts"]["config_path"]).exists())
             self.assertTrue(Path(task["artifacts"]["events_path"]).exists())
+            self.assertEqual(task["reminders"]["battery_threshold_percent"], 85)
+            self.assertEqual(task["reminders"]["precheck_lead_minutes"], 60)
+
+    def test_first_boot_setup_only_needs_time_window_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = first_boot_setup(
+                task_root=Path(tmp),
+                time_window_text="我希望 11:00-12:00 拍",
+            )
+            self.assertEqual(task["schedule"]["start_time"], "11:00")
+            self.assertEqual(task["schedule"]["end_time"], "12:00")
 
     def test_parse_merchant_command_supports_schedule_change_and_stop(self):
         parsed = parse_merchant_command("龙虾，帮我改一下拍摄时间 11:00-12:00")
@@ -78,6 +99,21 @@ class TaskManagerTests(unittest.TestCase):
 
         parsed_stop = parse_merchant_command("龙虾，停止拍摄")
         self.assertEqual(parsed_stop["intent"], "stop_capture")
+
+    def test_parse_merchant_command_supports_custom_capture_and_missing_follow_up(self):
+        parsed = parse_merchant_command("龙虾，从现在开始拍视频，每10分钟拍一次，拍到22:00")
+        self.assertTrue(parsed["recognized"])
+        self.assertEqual(parsed["intent"], "start_custom_capture")
+        self.assertEqual(parsed["interval_minutes"], 10)
+        self.assertEqual(parsed["end_time"], "22:00")
+        self.assertEqual(parsed["clip_duration_seconds"], 20)
+
+        missing = parse_merchant_command("龙虾，帮我拍视频")
+        self.assertTrue(missing["recognized"])
+        self.assertEqual(missing["intent"], "start_custom_capture")
+        self.assertIn("interval_minutes", missing["missing"])
+        self.assertIn("end_time", missing["missing"])
+        self.assertIn("拍到几点", missing["response"])
 
     def test_merchant_command_rejects_unsupported_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,6 +145,47 @@ class TaskManagerTests(unittest.TestCase):
             not_due_time = time.mktime(time.strptime("2026-04-01 12:00:00", "%Y-%m-%d %H:%M:%S"))
             self.assertTrue(task_is_due(reloaded, now_ts=due_time))
             self.assertFalse(task_is_due(reloaded, now_ts=not_due_time))
+
+    def test_merchant_command_can_start_custom_capture_without_changing_daily_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp),
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+            task_path = Path(task["artifacts"]["config_path"])
+            original_window = dict(task["schedule"])
+            with mock.patch("cb60_task_manager.time.time", return_value=time.mktime(time.strptime("2026-04-15 20:30:00", "%Y-%m-%d %H:%M:%S"))):
+                result = merchant_command(task_path, "龙虾，从现在开始拍视频，每10分钟拍一次，拍到22:00")
+            self.assertTrue(result["recognized"])
+            self.assertEqual(result["intent"], "start_custom_capture")
+            reloaded = load_task(task_path)
+            self.assertEqual(reloaded["schedule"], original_window)
+            self.assertTrue(reloaded["custom_capture"]["active"])
+            self.assertEqual(reloaded["custom_capture"]["interval_minutes"], 10)
+            self.assertEqual(reloaded["custom_capture"]["clip_duration_seconds"], 20)
+
+    def test_should_run_now_prefers_custom_capture_when_custom_window_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp),
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+            task_path = Path(task["artifacts"]["config_path"])
+            start_ts = time.mktime(time.strptime("2026-04-15 20:30:00", "%Y-%m-%d %H:%M:%S"))
+            with mock.patch("cb60_task_manager.time.time", return_value=start_ts):
+                merchant_command(task_path, "龙虾，从现在开始拍视频，每10分钟拍一次，拍到22:00")
+            reloaded = load_task(task_path)
+            active_ts = time.mktime(time.strptime("2026-04-15 21:00:00", "%Y-%m-%d %H:%M:%S"))
+            self.assertTrue(custom_capture_is_due(reloaded, now_ts=active_ts))
+            self.assertEqual(current_capture_mode(reloaded, now_ts=active_ts), "custom_capture")
+            payload = should_run_now(reloaded, now_ts=active_ts)
+            self.assertTrue(payload["should_run_now"])
+            self.assertEqual(payload["mode"], "custom_capture")
+            self.assertIn("custom_capture", payload)
 
     def test_record_session_and_daily_report_aggregate_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -196,6 +273,73 @@ class TaskManagerTests(unittest.TestCase):
             joined = " ".join(diagnosis["issues"])
             self.assertIn("10%", joined)
             self.assertIn("最近一次拍摄任务失败", joined)
+
+    def test_should_run_battery_precheck_checks_one_hour_before_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp) / "task",
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+            task_path = Path(task["artifacts"]["config_path"])
+            loaded = load_task(task_path)
+            inside_window = time.mktime(time.strptime("2026-04-01 10:20:00", "%Y-%m-%d %H:%M:%S"))
+            outside_window = time.mktime(time.strptime("2026-04-01 09:30:00", "%Y-%m-%d %H:%M:%S"))
+            self.assertTrue(should_run_battery_precheck(loaded, now_ts=inside_window))
+            self.assertFalse(should_run_battery_precheck(loaded, now_ts=outside_window))
+
+            next_start = next_capture_start_ts(loaded, now_ts=inside_window)
+            self.assertEqual(time.strftime("%H:%M", time.localtime(next_start)), "11:00")
+
+    def test_battery_precheck_requests_charge_below_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp) / "task",
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+
+            class FakeClient:
+                def __init__(self, config):
+                    self.config = config
+
+                def dump_device(self):
+                    return {
+                        "device_info": {"status": 1},
+                        "battery": {"battery_percent": 72},
+                    }
+
+            inside_window = time.mktime(time.strptime("2026-04-01 10:20:00", "%Y-%m-%d %H:%M:%S"))
+            payload = battery_precheck(
+                Path(task["artifacts"]["config_path"]),
+                now_ts=inside_window,
+                client_factory=FakeClient,
+            )
+            self.assertTrue(payload["should_check_now"])
+            self.assertTrue(payload["needs_charge_reminder"])
+            self.assertIn("请商家在下次拍摄前充电", payload["reminder_message"])
+
+    def test_workflow_spec_freezes_daily_recurring_rules(self):
+        spec = workflow_spec()
+        self.assertEqual(spec["plugin_contract"]["mode"], "recurring_daily_capture")
+        self.assertIn("每日", spec["plugin_contract"]["default_repeat_policy"])
+        self.assertTrue(spec["installation_onboarding"]["send_message_after_install"])
+        self.assertEqual(spec["merchant_onboarding"]["first_question"], "你希望这个摄像头在什么时候拍？")
+        self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["quality"], 1)
+        self.assertIn("高光剪辑 -> 去水印 -> 变高清", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
+        self.assertEqual(spec["custom_capture_rules"]["default_clip_duration_seconds"], 20)
+        self.assertTrue(spec["custom_capture_rules"]["coexist_with_recurring_daily_schedule"])
+
+    def test_install_onboarding_message_lists_required_fields(self):
+        payload = build_install_onboarding_message()
+        self.assertTrue(payload["send_after_install"])
+        self.assertIn("EZVIZ_APP_KEY", payload["required_fields"])
+        self.assertIn("TOS_ORIGINAL", payload["required_fields"])
+        self.assertIn("TOS_FINAL", payload["required_fields"])
+        self.assertEqual(payload["next_question"], "你希望这个摄像头在什么时候拍？")
+        self.assertIn("store1_jsspa_original", payload["message_text"])
 
 
 if __name__ == "__main__":

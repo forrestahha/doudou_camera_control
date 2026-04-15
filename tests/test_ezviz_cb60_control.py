@@ -24,6 +24,7 @@ from ezviz_cb60_control import (  # noqa: E402
     find_first_url,
     flatten_battery_signals,
     join_url,
+    normalize_stream_address_protocol,
     run_setup_wizard,
     write_env_file,
 )
@@ -104,6 +105,22 @@ class EzvizControlTests(unittest.TestCase):
             self.assertEqual(config.validate_code, "code-2")
             self.assertEqual(config.channel_no, 3)
 
+    def test_env_config_can_parse_las_inpaint_fixed_bboxes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "las.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "export EZVIZ_ACCESS_TOKEN='token-3'",
+                        "export EZVIZ_DEVICE_SERIAL='device-3'",
+                        "export LAS_INPAINT_FIXED_BBOXES='[[0,920,340,1000]]'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = EnvConfig.from_env(env_file=str(env_path))
+            self.assertEqual(config.las_inpaint_fixed_bboxes, ((0, 920, 340, 1000),))
+
     def test_extract_env_file_arg_accepts_inline_and_positional_forms(self):
         cleaned, env_file = extract_env_file_arg(["capture-shot", "--env-file", "~/.ezviz_cb60_env_cam2", "--foo"])
         self.assertEqual(cleaned, ["capture-shot", "--foo"])
@@ -125,17 +142,27 @@ class EzvizControlTests(unittest.TestCase):
                     "EZVIZ_DEVICE_SERIAL": "serial",
                     "EZVIZ_VALIDATE_CODE": "verify",
                     "EZVIZ_CHANNEL_NO": "1",
+                    "LAS_API_KEY": "las-key",
+                    "LAS_REGION": "cn-beijing",
+                    "TOS_ACCESS_KEY": "tos-ak",
+                    "TOS_SECRET_KEY": "tos-sk",
+                    "TOS_ORIGINAL": "tos://demo-bucket/openclaw/original/",
+                    "TOS_FINAL": "tos://demo-bucket/openclaw/final/",
                 },
             )
             text = path.read_text(encoding="utf-8")
             self.assertIn("export EZVIZ_APP_KEY='key'", text)
             self.assertIn("export EZVIZ_DEVICE_SERIAL='serial'", text)
+            self.assertIn("export LAS_API_KEY='las-key'", text)
+            self.assertIn("export TOS_ORIGINAL='tos://demo-bucket/openclaw/original/'", text)
+            self.assertIn("export TOS_FINAL='tos://demo-bucket/openclaw/final/'", text)
 
     def test_run_setup_wizard_creates_env_file(self):
         answers = iter(
             [
                 "device-9",
                 "1",
+                "no",
             ]
         )
         secret_answers = iter(
@@ -157,9 +184,70 @@ class EzvizControlTests(unittest.TestCase):
             )
             self.assertTrue(env_path.exists())
             self.assertEqual(payload["env_file"], str(env_path))
+            self.assertFalse(payload["las_tos_configured"])
             loaded = EnvConfig.from_env(env_file=str(env_path))
             self.assertEqual(loaded.app_key, "key-9")
             self.assertEqual(loaded.device_serial, "device-9")
+
+    def test_run_setup_wizard_can_collect_las_and_tos_fields(self):
+        answers = iter(
+            [
+                "device-10",
+                "1",
+                "yes",
+                "cn-beijing",
+                "tos://demo-bucket/openclaw/original/",
+                "tos://demo-bucket/openclaw/final/",
+            ]
+        )
+        secret_answers = iter(
+            [
+                "key-10",
+                "secret-10",
+                "token-10",
+                "verify-10",
+                "las-key-10",
+                "tos-ak-10",
+                "tos-sk-10",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "wizard-las.env"
+            payload = run_setup_wizard(
+                output_path=env_path,
+                force=True,
+                prompt_func=lambda _prompt: next(answers),
+                secret_prompt_func=lambda _prompt: next(secret_answers),
+            )
+            self.assertTrue(payload["las_tos_configured"])
+            loaded = EnvConfig.from_env(env_file=str(env_path))
+            self.assertEqual(loaded.las_api_key, "las-key-10")
+            self.assertEqual(loaded.las_region, "cn-beijing")
+            self.assertEqual(loaded.tos_original, "tos://demo-bucket/openclaw/original/")
+            self.assertEqual(loaded.tos_final, "tos://demo-bucket/openclaw/final/")
+
+    def test_normalize_stream_address_protocol_accepts_legacy_flv_alias(self):
+        self.assertEqual(normalize_stream_address_protocol(1), 1)
+        self.assertEqual(normalize_stream_address_protocol(2), 2)
+        self.assertEqual(normalize_stream_address_protocol(3), 3)
+        self.assertEqual(normalize_stream_address_protocol(4), 3)
+
+    def test_doctor_reports_optional_postprocess_fields(self):
+        config = EnvConfig(
+            access_token="token",
+            device_serial="serial",
+            las_api_key="las-key",
+            las_region="cn-beijing",
+            tos_access_key="tos-ak",
+            tos_secret_key="tos-sk",
+            tos_original="tos://demo-bucket/openclaw/original/",
+            tos_final="tos://demo-bucket/openclaw/final/",
+        )
+        payload = config.doctor()
+        self.assertTrue(payload["optional_postprocess"]["LAS_API_KEY"])
+        self.assertTrue(payload["optional_postprocess"]["TOS_ORIGINAL"])
+        self.assertTrue(payload["optional_postprocess"]["TOS_FINAL"])
 
     def test_ptz_pulse_issues_start_and_stop(self):
         requester = FakeRequester(

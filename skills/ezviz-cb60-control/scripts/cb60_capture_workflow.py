@@ -4,15 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -27,6 +32,31 @@ DEFAULT_LIVE_MUTE = 0
 DEFAULT_LIVE_ADDRESS_TYPE = 1
 DEFAULT_LOG_NAME = "capture-log.jsonl"
 DEFAULT_REPORT_NAME = "capture-report.md"
+LAS_PIPELINE_SKILL_ORDER: Tuple[Tuple[str, str], ...] = (
+    ("upload_to_tos", "上传到火山 TOS"),
+    ("las_highlight_edit", "LAS 高光剪辑"),
+    ("las_video_inpaint", "LAS 去水印"),
+    ("las_video_resize", "LAS 变高清"),
+)
+LAS_EDIT_SKILL_PATH = Path.home() / ".codex" / "skills" / "byted-las-video-edit" / "scripts" / "skill.py"
+LAS_INPAINT_SKILL_PATH = Path.home() / ".codex" / "skills" / "byted-las-video-inpaint" / "scripts" / "skill.py"
+LAS_RESIZE_SKILL_PATH = Path.home() / ".codex" / "skills" / "byted-las-video-resize" / "scripts" / "skill.py"
+LAS_SKILL_CALL_LOCK = threading.RLock()
+DEFAULT_LAS_HIGHLIGHT_PROMPT_TEMPLATE = (
+    "任务：对商家高光用餐时段，在后厨或前台固定摆放摄像头拍摄的视频，进行高光时刻识别与剪辑提取。"
+    " 高光时刻标准：画面具备动态变化，无静止卡顿；画面内容丰富，包含有效场景动作，典型示例包括菜品上菜全过程、后厨食材处理、前台接待或操作、"
+    "人员走动互动、餐具摆放等营业相关动态画面。 非高光剔除标准：完全静态、无人物、无动作、无画面变化的空镜画面；无有效内容的单调静止镜头。"
+    " 输出要求：精准截取视频中的高光片段，剔除所有静态无效画面，完成高光时刻精简剪辑，保留完整连贯的有效动态内容。"
+    " 当前镜头重点：{focus}。"
+)
+DEFAULT_LAS_INPAINT_TARGETS: Tuple[str, ...] = ("watermark",)
+DEFAULT_LAS_INPAINT_BACKEND = "pixel_replace"
+# 1000x1000 归一化坐标，默认加强左下角时间水印区域。
+DEFAULT_LAS_INPAINT_FIXED_BBOXES: Tuple[Tuple[int, int, int, int], ...] = ((0, 650, 150, 970),)
+DEFAULT_LAS_RESIZE_MIN_WIDTH = 1440
+DEFAULT_LAS_RESIZE_MAX_WIDTH = 2560
+DEFAULT_LAS_RESIZE_MIN_HEIGHT = 2560
+DEFAULT_LAS_RESIZE_MAX_HEIGHT = 2560
 
 
 ZONE_ORDER = {
@@ -235,6 +265,23 @@ def init_session(brief: str, session_root: Path, max_shots: int = 4) -> JsonDict
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "brief": brief,
         "storage_root": str(session_dir),
+        "las_pipeline": {
+            "enabled": True,
+            "execution_mode": "deferred_until_tos_ready",
+            "source_policy": "use_final_mp4_if_available_else_raw_capture",
+            "required_bridge": {
+                "type": "tos_upload",
+                "status": "pending_config",
+                "message": "需要先提供火山 TOS 上传访问配置，LAS 才能从 tos:// 路径取视频。",
+            },
+            "steps": [
+                {
+                    "step": step_id,
+                    "label": label,
+                }
+                for step_id, label in LAS_PIPELINE_SKILL_ORDER
+            ],
+        },
         "workflow_artifacts": {
             "log_path": str(session_dir / DEFAULT_LOG_NAME),
             "report_path": str(session_dir / DEFAULT_REPORT_NAME),
@@ -358,6 +405,7 @@ def record_flv_clip(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        errors="replace",
     )
     timed_out = False
     try:
@@ -397,6 +445,7 @@ def transcode_recording_to_mp4(input_path: Path, rotation_mode: RotationMode = "
         check=False,
         capture_output=True,
         text=True,
+        errors="replace",
     )
     if completed.returncode != 0 or not output_path.exists():
         return {
@@ -535,7 +584,7 @@ def ffprobe_json(media_path: Path) -> JsonDict:
         "json",
         str(media_path),
     ]
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    completed = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace")
     if completed.returncode != 0 or not completed.stdout.strip():
         return {}
     try:
@@ -589,6 +638,206 @@ def classify_capture_output(metrics: JsonDict, target_duration: int) -> str:
     return "failed"
 
 
+def has_las_postprocess_config(config: EnvConfig) -> bool:
+    return all(
+        (
+            config.las_api_key,
+            config.las_region,
+            config.tos_access_key,
+            config.tos_secret_key,
+            config.tos_original,
+            config.tos_final,
+        )
+    )
+
+
+def normalize_tos_prefix(prefix: str) -> str:
+    value = prefix.strip()
+    if not value:
+        raise EzvizError("TOS prefix is empty.")
+    if not value.startswith("tos://"):
+        raise EzvizError(f"Invalid TOS prefix: {value}")
+    if not value.endswith("/"):
+        value += "/"
+    return value
+
+
+def parse_tos_url(url: str) -> Tuple[str, str]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "tos" or not parsed.netloc or not parsed.path:
+        raise EzvizError(f"Invalid TOS URL: {url}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def join_tos_prefix(prefix: str, *parts: str) -> str:
+    normalized = normalize_tos_prefix(prefix)
+    parsed = urllib.parse.urlparse(normalized)
+    key_prefix = parsed.path.lstrip("/")
+    suffix = "/".join(part.strip("/") for part in parts if part)
+    key = key_prefix + suffix
+    return f"tos://{parsed.netloc}/{key}"
+
+
+def build_las_stage_prefix(prefix: str, unique_prefix: str, stage_name: str) -> str:
+    return normalize_tos_prefix(join_tos_prefix(prefix, unique_prefix, stage_name))
+
+
+def write_json_artifact(path: Path, payload: JsonDict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def build_tos_client(config: EnvConfig) -> Any:
+    try:
+        import tos  # type: ignore
+    except ImportError as exc:
+        raise EzvizError("Missing tos SDK; unable to upload videos to TOS.") from exc
+
+    region = config.las_region or "cn-beijing"
+    endpoint = f"tos-{region}.volces.com"
+    return tos.TosClientV2(
+        ak=config.tos_access_key,
+        sk=config.tos_secret_key,
+        endpoint=endpoint,
+        region=region,
+    )
+
+
+def upload_local_file_to_tos(config: EnvConfig, local_path: Path, target_tos_url: str) -> JsonDict:
+    if not local_path.exists():
+        raise EzvizError(f"Local file not found for TOS upload: {local_path}")
+
+    bucket, key = parse_tos_url(target_tos_url)
+    client = build_tos_client(config)
+    with local_path.open("rb") as handle:
+        client.put_object(
+            bucket=bucket,
+            key=key,
+            content=handle,
+            content_type="video/mp4",
+        )
+    client.head_object(bucket=bucket, key=key)
+    return {
+        "bucket": bucket,
+        "key": key,
+        "tos_url": target_tos_url,
+        "size_bytes": local_path.stat().st_size,
+    }
+
+
+@lru_cache(maxsize=8)
+def load_skill_module(module_name: str, script_path: str) -> Any:
+    path = Path(script_path)
+    if not path.exists():
+        raise EzvizError(f"Skill script not found: {path}")
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise EzvizError(f"Unable to load skill script: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@contextmanager
+def las_env_context(config: EnvConfig) -> Iterable[None]:
+    keys = {
+        "LAS_API_KEY": config.las_api_key,
+        "LAS_REGION": config.las_region,
+    }
+    previous = {name: os.environ.get(name) for name in keys}
+    try:
+        for name, value in keys.items():
+            if value:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def las_skill_call_context(config: EnvConfig) -> Iterable[None]:
+    # LAS skill 在运行时直接从进程环境读取 API key，线程间需要串行化这段临界区。
+    with LAS_SKILL_CALL_LOCK:
+        with las_env_context(config):
+            yield
+
+
+def call_las_skill(config: EnvConfig, func: Callable[..., JsonDict], *args: Any, **kwargs: Any) -> JsonDict:
+    with las_skill_call_context(config):
+        return func(*args, **kwargs)
+
+
+def wait_for_poll_completion(
+    poller: Callable[[], JsonDict],
+    *,
+    timeout_seconds: int = 1800,
+    interval_seconds: int = 5,
+) -> JsonDict:
+    started = time.time()
+    while True:
+        result = poller()
+        metadata = result.get("metadata", {})
+        status = metadata.get("task_status")
+        business_code = metadata.get("business_code")
+        error_msg = metadata.get("error_msg")
+        if status == "COMPLETED" and str(business_code) in {"0", "200"}:
+            return result
+        if status in {"FAILED", "TIMEOUT"} or (status == "COMPLETED" and str(business_code) not in {"0", "200"}):
+            raise EzvizError(f"LAS task failed: status={status} business_code={business_code} error_msg={error_msg}")
+        if time.time() - started > timeout_seconds:
+            raise EzvizError(f"LAS task timed out after {timeout_seconds}s; last status={status}")
+        time.sleep(interval_seconds)
+
+
+def build_las_task_description(task_label: str, task_text: str) -> str:
+    focus = task_text.strip() or task_label.strip() or "店内经营画面"
+    return DEFAULT_LAS_HIGHLIGHT_PROMPT_TEMPLATE.format(focus=focus)
+
+
+def build_capture_timestamp(ts: Optional[float] = None) -> str:
+    moment = time.localtime(time.time() if ts is None else ts)
+    return time.strftime("%Y%m%d-%H%M%S", moment)
+
+
+def build_timestamped_shot_path(shots_dir: Path, shot_index: int, shot_id: str, timestamp: str, suffix: str) -> Path:
+    return shots_dir / f"{shot_index:02d}-{shot_id}-{timestamp}{suffix}"
+
+
+def derive_store_slug_from_tos_prefix(*prefixes: str) -> str:
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        parsed = urllib.parse.urlparse(normalize_tos_prefix(prefix))
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if not parts:
+            continue
+        candidate = parts[-1]
+        for suffix in ("_original", "_final"):
+            if candidate.endswith(suffix):
+                candidate = candidate[: -len(suffix)]
+                break
+        candidate = re.sub(r"[^a-zA-Z0-9_-]+", "_", candidate).strip("_")
+        if candidate:
+            return candidate
+    return "openclaw_store"
+
+
+def build_tos_video_filename(store_slug: str, capture_timestamp: str, stage: str, seq: int, suffix: str = ".mp4") -> str:
+    date_part, time_part = capture_timestamp.split("-", 1)
+    normalized_stage = re.sub(r"[^a-zA-Z0-9_-]+", "_", stage).strip("_") or "original"
+    return f"{store_slug}_{date_part}_{time_part}_{normalized_stage}_{seq:02d}{suffix}"
+
+
+def resolve_las_inpaint_fixed_bboxes(config: EnvConfig) -> List[List[int]]:
+    boxes = config.las_inpaint_fixed_bboxes or DEFAULT_LAS_INPAINT_FIXED_BBOXES
+    return [list(item) for item in boxes]
+
+
 def extract_failure_frame(input_path: Path, output_path: Path, second: float = 1.0) -> Optional[Path]:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path or not input_path.exists():
@@ -605,7 +854,7 @@ def extract_failure_frame(input_path: Path, output_path: Path, second: float = 1
         "1",
         str(output_path),
     ]
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    completed = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace")
     if completed.returncode != 0 or not output_path.exists():
         return None
     return output_path
@@ -633,7 +882,7 @@ def analyze_failure_frame(frame_path: Optional[Path], metrics: JsonDict) -> str:
             "--psm",
             "6",
         ]
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace")
         text = " ".join(completed.stdout.split())
         if text:
             analysis_parts.append(f"OCR文本={text[:240]}")
@@ -663,28 +912,286 @@ def render_workflow_report(session: JsonDict, session_path: Path) -> Path:
         f"- Accepted shots: {accepted_count}",
         f"- Abnormal shots: {abnormal_count}",
         f"- Failed shots: {failed_count}",
+        f"- LAS pipeline mode: {session.get('las_pipeline', {}).get('execution_mode', 'disabled')}",
         "",
         "## Shots",
         "",
-        "| # | Label | Capture | Validation | Output | Notes |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| # | Label | Capture | Validation | LAS | Output | Notes |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for shot in shots:
         validation = shot.get("validation", {})
+        postprocess = shot.get("postprocess", {})
         note = validation.get("analysis") or ""
         note = note.replace("|", "/")[:120]
         lines.append(
-            "| {index} | {label} | {capture} | {validation_status} | {output_path} | {note} |".format(
+            "| {index} | {label} | {capture} | {validation_status} | {postprocess_status} | {output_path} | {note} |".format(
                 index=shot.get("index", "-"),
                 label=shot.get("label", ""),
                 capture=shot.get("status", ""),
                 validation_status=validation.get("status", "pending"),
+                postprocess_status=postprocess.get("status", "pending"),
                 output_path=Path(shot.get("output_path", "")).name,
                 note=note,
             )
         )
     report_path.write_text("\n".join(lines), encoding="utf-8")
     return report_path
+
+
+def build_las_postprocess_state(
+    session: JsonDict,
+    shot: JsonDict,
+    final_output_path: str,
+    validation_status: str,
+) -> JsonDict:
+    pipeline_config = session.get("las_pipeline", {})
+    source_path = final_output_path or shot.get("output_path", "")
+    if validation_status != "accepted":
+        return {
+            "status": "skipped_capture_not_accepted",
+            "source_path": source_path,
+            "reason": "只有验片通过的片段才会进入 LAS 后处理流水线。",
+            "steps": [
+                {
+                    "step": step_id,
+                    "label": label,
+                    "status": "skipped",
+                    "reason": "capture_not_accepted",
+                }
+                for step_id, label in LAS_PIPELINE_SKILL_ORDER
+            ],
+        }
+
+    tos_bridge = pipeline_config.get("required_bridge", {})
+    bridge_status = tos_bridge.get("status", "pending_config")
+    bridge_message = tos_bridge.get("message", "缺少 TOS 上传访问配置。")
+    steps: List[JsonDict] = []
+    for index, (step_id, label) in enumerate(LAS_PIPELINE_SKILL_ORDER):
+        if index == 0:
+            steps.append(
+                {
+                    "step": step_id,
+                    "label": label,
+                    "status": bridge_status,
+                    "reason": bridge_message,
+                }
+            )
+            continue
+        steps.append(
+            {
+                "step": step_id,
+                "label": label,
+                "status": "blocked",
+                "depends_on": LAS_PIPELINE_SKILL_ORDER[index - 1][0],
+                "reason": "等待上一环节完成后再执行。",
+            }
+        )
+    return {
+        "status": bridge_status,
+        "execution_mode": pipeline_config.get("execution_mode", "deferred_until_tos_ready"),
+        "source_path": source_path,
+        "input_policy": pipeline_config.get("source_policy", "use_final_mp4_if_available_else_raw_capture"),
+        "steps": steps,
+    }
+
+
+def run_las_postprocess_pipeline(
+    *,
+    config: EnvConfig,
+    session: JsonDict,
+    shot: JsonDict,
+    final_output_path: str,
+    validation_status: str,
+    artifacts_root: Path,
+) -> JsonDict:
+    if validation_status != "accepted":
+        return build_las_postprocess_state(session, shot, final_output_path, validation_status)
+    if not has_las_postprocess_config(config):
+        return build_las_postprocess_state(session, shot, final_output_path, validation_status)
+
+    source_path = Path(final_output_path)
+    if not source_path.exists():
+        raise EzvizError(f"Missing accepted capture for LAS pipeline: {source_path}")
+
+    session_id = str(session.get("session_id", "session"))
+    shot_index = int(shot.get("index", 0) or 0)
+    shot_id = str(shot.get("shot_id", "shot"))
+    shot_label = str(shot.get("label", ""))
+    shot_text = str(shot.get("request_text", ""))
+    capture_timestamp = str(shot.get("capture_timestamp") or session.get("capture_timestamp") or build_capture_timestamp())
+    store_slug = derive_store_slug_from_tos_prefix(config.tos_original, config.tos_final)
+    unique_prefix = f"{session_id}/{shot_index:02d}-{shot_id}"
+    original_output_name = build_tos_video_filename(store_slug, capture_timestamp, "original", shot_index)
+    original_tos_url = join_tos_prefix(config.tos_original, unique_prefix, original_output_name)
+    edit_output_prefix = build_las_stage_prefix(config.tos_original, unique_prefix, "las-edit")
+    inpaint_output_prefix = build_las_stage_prefix(config.tos_original, unique_prefix, "las-inpaint")
+    final_output_name = build_tos_video_filename(store_slug, capture_timestamp, "final", shot_index)
+
+    steps: List[JsonDict] = [
+        {"step": step_id, "label": label, "status": "pending"}
+        for step_id, label in LAS_PIPELINE_SKILL_ORDER
+    ]
+    results_dir = artifacts_root / "las-results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    def block_remaining(start_index: int, reason: str) -> None:
+        for index in range(start_index, len(steps)):
+            if steps[index]["status"] == "pending":
+                steps[index]["status"] = "blocked"
+                steps[index]["reason"] = reason
+
+    try:
+        upload_info = upload_local_file_to_tos(config, source_path, original_tos_url)
+        steps[0].update(
+            {
+                "status": "completed",
+                "tos_url": upload_info["tos_url"],
+                "size_bytes": upload_info["size_bytes"],
+            }
+        )
+        write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-upload.json", upload_info)
+
+        edit_module = load_skill_module("las_video_edit_skill", str(LAS_EDIT_SKILL_PATH))
+        edit_submit = call_las_skill(
+            config,
+            edit_module.submit_task,
+            region=config.las_region,
+            video_url=original_tos_url,
+            output_tos_path=edit_output_prefix,
+            task_description=build_las_task_description(shot_label, shot_text),
+            mode="simple",
+            output_format="mp4",
+        )
+        edit_task_id = ((edit_submit.get("metadata") or {}).get("task_id")) or ""
+        edit_result = wait_for_poll_completion(
+            lambda: call_las_skill(
+                config,
+                edit_module.poll_task,
+                edit_task_id,
+                region=config.las_region,
+            ),
+            timeout_seconds=1800,
+            interval_seconds=5,
+        )
+
+        write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-edit.json", edit_result)
+        clips = ((edit_result.get("data") or {}).get("clips") or [])
+        first_clip = clips[0] if clips else {}
+        clip_url = first_clip.get("clip_url") if isinstance(first_clip, dict) else ""
+        if not clip_url:
+            raise EzvizError("LAS highlight step completed but returned no clip_url.")
+        steps[1].update(
+            {
+                "status": "completed",
+                "task_id": edit_task_id,
+                "clip_url": clip_url,
+                "clip_count": len(clips),
+            }
+        )
+
+        inpaint_module = load_skill_module("las_video_inpaint_skill", str(LAS_INPAINT_SKILL_PATH))
+        inpaint_submit = call_las_skill(
+            config,
+            inpaint_module.submit_task,
+            region=config.las_region,
+            video_url=clip_url,
+            output_tos_path=inpaint_output_prefix,
+            targets=list(DEFAULT_LAS_INPAINT_TARGETS),
+            detection_precise_mode=True,
+            inpainting_backend=DEFAULT_LAS_INPAINT_BACKEND,
+            fixed_bboxes=resolve_las_inpaint_fixed_bboxes(config),
+        )
+        inpaint_task_id = ((inpaint_submit.get("metadata") or {}).get("task_id")) or ""
+        inpaint_result = wait_for_poll_completion(
+            lambda: call_las_skill(
+                config,
+                inpaint_module.poll_task,
+                region=config.las_region,
+                task_id=inpaint_task_id,
+            ),
+            timeout_seconds=1800,
+            interval_seconds=5,
+        )
+
+        write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-inpaint.json", inpaint_result)
+        inpainted_video_path = ((inpaint_result.get("data") or {}).get("inpainted_video_path")) or ""
+        if not inpainted_video_path:
+            raise EzvizError("LAS inpaint step completed but returned no inpainted_video_path.")
+        steps[2].update(
+            {
+                "status": "completed",
+                "task_id": inpaint_task_id,
+                "inpainted_video_path": inpainted_video_path,
+            }
+        )
+
+        resize_module = load_skill_module("las_video_resize_skill", str(LAS_RESIZE_SKILL_PATH))
+        resize_submit = call_las_skill(
+            config,
+            resize_module.submit_task,
+            api_base=None,
+            region=config.las_region,
+            video_path=inpainted_video_path,
+            output_tos_dir=normalize_tos_prefix(config.tos_final),
+            output_file_name=final_output_name,
+            min_width=DEFAULT_LAS_RESIZE_MIN_WIDTH,
+            max_width=DEFAULT_LAS_RESIZE_MAX_WIDTH,
+            min_height=DEFAULT_LAS_RESIZE_MIN_HEIGHT,
+            max_height=DEFAULT_LAS_RESIZE_MAX_HEIGHT,
+            force_original_aspect_ratio_type="increase",
+            force_divisible_by=2,
+        )
+        resize_task_id = ((resize_submit.get("metadata") or {}).get("task_id")) or ""
+        resize_result = wait_for_poll_completion(
+            lambda: call_las_skill(
+                config,
+                resize_module.poll_task,
+                api_base=None,
+                region=config.las_region,
+                task_id=resize_task_id,
+            ),
+            timeout_seconds=1800,
+            interval_seconds=5,
+        )
+
+        write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-resize.json", resize_result)
+        final_tos_path = ((resize_result.get("data") or {}).get("output_path")) or ""
+        if not final_tos_path:
+            raise EzvizError("LAS resize step completed but returned no output_path.")
+        steps[3].update(
+            {
+                "status": "completed",
+                "task_id": resize_task_id,
+                "output_path": final_tos_path,
+            }
+        )
+
+        return {
+            "status": "completed",
+            "execution_mode": "inline_after_capture",
+            "source_path": str(source_path),
+            "uploaded_tos_path": original_tos_url,
+            "final_tos_path": final_tos_path,
+            "input_policy": session.get("las_pipeline", {}).get("source_policy", "use_final_mp4_if_available_else_raw_capture"),
+            "steps": steps,
+        }
+    except Exception as exc:
+        for index, step in enumerate(steps):
+            if step["status"] == "pending":
+                step["status"] = "failed"
+                step["reason"] = str(exc)
+                block_remaining(index + 1, "上一 LAS 步骤失败，后续已阻塞。")
+                break
+        return {
+            "status": "failed",
+            "execution_mode": "inline_after_capture",
+            "source_path": str(source_path),
+            "uploaded_tos_path": original_tos_url,
+            "reason": str(exc),
+            "input_policy": session.get("las_pipeline", {}).get("source_policy", "use_final_mp4_if_available_else_raw_capture"),
+            "steps": steps,
+        }
 
 
 def record_stream_clip(
@@ -731,6 +1238,7 @@ def capture_next_shot(
         }
 
     effective_stream_url = stream_url or resolve_stream_url(config, source=source, protocol_id=protocol_id)
+    capture_timestamp = build_capture_timestamp()
     log_path = log_func(
         session,
         session_path,
@@ -748,7 +1256,14 @@ def capture_next_shot(
             },
         },
     )
-    raw_output_path = build_raw_recording_path(Path(shot["output_path"]), effective_stream_url)
+    base_output_path = build_timestamped_shot_path(
+        session_path.parent / "shots",
+        int(shot["index"]),
+        str(shot["shot_id"]),
+        capture_timestamp,
+        ".ts",
+    )
+    raw_output_path = build_raw_recording_path(base_output_path, effective_stream_url)
     result = record_stream_clip(
         stream_url=effective_stream_url,
         output_path=raw_output_path,
@@ -768,12 +1283,25 @@ def capture_next_shot(
     if validation_status != "accepted" and inspection_path.exists():
         frame_path = extract_frame_func(
             inspection_path,
-            session_path.parent / "shots" / f"{shot['index']:02d}-{shot['shot_id']}-failure-frame.jpg",
+            build_timestamped_shot_path(
+                session_path.parent / "shots",
+                int(shot["index"]),
+                str(shot["shot_id"]),
+                capture_timestamp,
+                "-failure-frame.jpg",
+            ),
             1.0,
         )
         failure_analysis = analyze_failure_func(frame_path, metrics)
 
+    if has_las_postprocess_config(config):
+        session.setdefault("las_pipeline", {})["execution_mode"] = "inline_after_capture"
+        session["las_pipeline"].setdefault("required_bridge", {})
+        session["las_pipeline"]["required_bridge"]["status"] = "configured"
+        session["las_pipeline"]["required_bridge"]["message"] = "已配置 TOS 和 LAS，录制完成后会自动执行后处理。"
+
     captured = mark_shot_captured(session, shot["index"], output_path=final_output_path)
+    captured["capture_timestamp"] = capture_timestamp
     captured["raw_output_path"] = result["output_path"]
     captured["validation"] = {
         "status": validation_status,
@@ -781,6 +1309,14 @@ def capture_next_shot(
         "frame_path": str(frame_path) if frame_path else None,
         "analysis": failure_analysis,
     }
+    captured["postprocess"] = run_las_postprocess_pipeline(
+        config=config,
+        session=session,
+        shot=captured,
+        final_output_path=final_output_path,
+        validation_status=validation_status,
+        artifacts_root=session_path.parent,
+    )
     save_session(session_path, session)
     report_path = report_func(session, session_path)
     log_func(
@@ -793,6 +1329,7 @@ def capture_next_shot(
             "recording": result,
             "conversion": conversion,
             "validation": captured["validation"],
+            "postprocess": captured["postprocess"],
             "final_output_path": final_output_path,
         },
     )

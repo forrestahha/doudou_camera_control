@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -17,8 +19,17 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from cb60_capture_workflow import (  # noqa: E402
     analyze_failure_frame,
+    build_capture_timestamp,
+    build_tos_video_filename,
+    build_las_stage_prefix,
     build_rotated_mp4_command,
+    build_las_task_description,
+    resolve_las_inpaint_fixed_bboxes,
+    build_timestamped_shot_path,
+    derive_store_slug_from_tos_prefix,
+    las_skill_call_context,
     build_raw_recording_path,
+    build_las_postprocess_state,
     classify_capture_output,
     capture_next_shot,
     extract_failure_frame,
@@ -142,6 +153,8 @@ class WorkflowTests(unittest.TestCase):
             session_path = Path(session["storage_root"]) / "session.json"
             self.assertTrue(session_path.exists())
             self.assertTrue(session["shots"][0]["output_path"].endswith(".ts"))
+            self.assertTrue(session["las_pipeline"]["enabled"])
+            self.assertEqual(session["las_pipeline"]["required_bridge"]["status"], "pending_config")
 
     def test_mark_shot_captured_updates_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,6 +163,24 @@ class WorkflowTests(unittest.TestCase):
             summary = session_summary(session)
             self.assertEqual(summary["completed_count"], 1)
             self.assertEqual(get_next_pending_shot(session)["index"], 2)
+
+    def test_build_capture_timestamp_uses_expected_format(self):
+        self.assertEqual(build_capture_timestamp(1776163200), "20260414-184000")
+
+    def test_build_timestamped_shot_path_includes_time(self):
+        path = build_timestamped_shot_path(Path("/tmp/shots"), 1, "process", "20260414-160101", ".ts")
+        self.assertEqual(path, Path("/tmp/shots/01-process-20260414-160101.ts"))
+
+    def test_derive_store_slug_from_tos_prefix_removes_stage_suffix(self):
+        slug = derive_store_slug_from_tos_prefix(
+            "tos://doudou-video/openclaw/store1_jsspa_original/",
+            "tos://doudou-video/openclaw/store1_jsspa_final/",
+        )
+        self.assertEqual(slug, "store1_jsspa")
+
+    def test_build_tos_video_filename_uses_store_date_time_stage_and_seq(self):
+        filename = build_tos_video_filename("store1_jsspa", "20260415-101530", "original", 2)
+        self.assertEqual(filename, "store1_jsspa_20260415_101530_original_02.mp4")
 
     def test_record_hls_clip_collects_segments(self):
         playlist = "\n".join(
@@ -319,9 +350,15 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(Path(reloaded["shots"][0]["output_path"]).exists())
             self.assertTrue(reloaded["shots"][0]["output_path"].endswith(".mp4"))
             self.assertTrue(reloaded["shots"][0]["raw_output_path"].endswith(".ts"))
+            self.assertRegex(Path(reloaded["shots"][0]["output_path"]).name, r"01-storefront-\d{8}-\d{6}\.mp4")
+            self.assertRegex(Path(reloaded["shots"][0]["raw_output_path"]).name, r"01-storefront-\d{8}-\d{6}\.ts")
             self.assertTrue(payload["conversion"]["ok"])
             self.assertEqual(payload["conversion"]["layout"], "cw90")
             self.assertEqual(reloaded["shots"][0]["validation"]["status"], "accepted")
+            self.assertRegex(reloaded["shots"][0]["capture_timestamp"], r"\d{8}-\d{6}")
+            self.assertEqual(reloaded["shots"][0]["postprocess"]["status"], "pending_config")
+            self.assertEqual(reloaded["shots"][0]["postprocess"]["steps"][0]["step"], "upload_to_tos")
+            self.assertEqual(reloaded["shots"][0]["postprocess"]["steps"][1]["step"], "las_highlight_edit")
             self.assertTrue(Path(payload["workflow_log_path"]).exists())
             self.assertTrue(Path(payload["workflow_report_path"]).exists())
 
@@ -446,7 +483,101 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(validation["status"], "abnormal")
             self.assertIn("分析完成", validation["analysis"])
             self.assertTrue(Path(validation["frame_path"]).exists())
+            self.assertEqual(reloaded["shots"][0]["postprocess"]["status"], "skipped_capture_not_accepted")
             self.assertEqual(payload["captured_shot"]["validation"]["status"], "abnormal")
+
+    def test_build_las_postprocess_state_marks_pending_config_for_accepted_clip(self):
+        session = init_session("门头", Path(tempfile.mkdtemp()))
+        shot = session["shots"][0]
+        state = build_las_postprocess_state(
+            session=session,
+            shot=shot,
+            final_output_path="/tmp/demo.mp4",
+            validation_status="accepted",
+        )
+        self.assertEqual(state["status"], "pending_config")
+        self.assertEqual(state["steps"][0]["step"], "upload_to_tos")
+        self.assertEqual(state["steps"][0]["status"], "pending_config")
+        self.assertEqual(state["steps"][1]["status"], "blocked")
+
+    def test_build_las_postprocess_state_skips_unaccepted_clip(self):
+        session = init_session("门头", Path(tempfile.mkdtemp()))
+        shot = session["shots"][0]
+        state = build_las_postprocess_state(
+            session=session,
+            shot=shot,
+            final_output_path="/tmp/demo.mp4",
+            validation_status="failed",
+        )
+        self.assertEqual(state["status"], "skipped_capture_not_accepted")
+        self.assertTrue(all(step["status"] == "skipped" for step in state["steps"]))
+
+    def test_build_las_task_description_uses_business_highlight_prompt(self):
+        description = build_las_task_description("后厨", "上菜全过程和前台接待")
+        self.assertIn("高光时刻标准", description)
+        self.assertIn("非高光剔除标准", description)
+        self.assertIn("输出要求", description)
+        self.assertIn("上菜全过程和前台接待", description)
+
+    def test_resolve_las_inpaint_fixed_bboxes_defaults_to_bottom_left_timestamp_area(self):
+        config = EnvConfig()
+        self.assertEqual(resolve_las_inpaint_fixed_bboxes(config), [[0, 650, 150, 970]])
+
+    def test_resolve_las_inpaint_fixed_bboxes_prefers_env_override(self):
+        config = EnvConfig(las_inpaint_fixed_bboxes=((10, 900, 280, 990),))
+        self.assertEqual(resolve_las_inpaint_fixed_bboxes(config), [[10, 900, 280, 990]])
+
+    def test_build_las_stage_prefix_isolated_per_round(self):
+        edit_prefix = build_las_stage_prefix(
+            "tos://demo-bucket/openclaw/original/",
+            "session-1/01-round-01",
+            "las-edit",
+        )
+        inpaint_prefix = build_las_stage_prefix(
+            "tos://demo-bucket/openclaw/original/",
+            "session-1/02-round-02",
+            "las-inpaint",
+        )
+        self.assertEqual(edit_prefix, "tos://demo-bucket/openclaw/original/session-1/01-round-01/las-edit/")
+        self.assertEqual(inpaint_prefix, "tos://demo-bucket/openclaw/original/session-1/02-round-02/las-inpaint/")
+
+    def test_las_skill_call_context_serializes_env_access_between_threads(self):
+        config_a = EnvConfig(las_api_key="key-A", las_region="region-A")
+        config_b = EnvConfig(las_api_key="key-B", las_region="region-B")
+        entered_a = threading.Event()
+        release_a = threading.Event()
+        thread_b_done = threading.Event()
+        seen: list[tuple[str, str, str]] = []
+
+        previous_key = os.environ.get("LAS_API_KEY")
+        previous_region = os.environ.get("LAS_REGION")
+
+        def worker_a():
+            with las_skill_call_context(config_a):
+                seen.append(("a", os.environ.get("LAS_API_KEY", ""), os.environ.get("LAS_REGION", "")))
+                entered_a.set()
+                release_a.wait(timeout=2)
+
+        def worker_b():
+            entered_a.wait(timeout=2)
+            with las_skill_call_context(config_b):
+                seen.append(("b", os.environ.get("LAS_API_KEY", ""), os.environ.get("LAS_REGION", "")))
+            thread_b_done.set()
+
+        ta = threading.Thread(target=worker_a)
+        tb = threading.Thread(target=worker_b)
+        ta.start()
+        tb.start()
+        entered_a.wait(timeout=2)
+        self.assertFalse(thread_b_done.is_set())
+        release_a.set()
+        ta.join(timeout=2)
+        tb.join(timeout=2)
+
+        self.assertEqual(seen[0], ("a", "key-A", "region-A"))
+        self.assertEqual(seen[1], ("b", "key-B", "region-B"))
+        self.assertEqual(os.environ.get("LAS_API_KEY"), previous_key)
+        self.assertEqual(os.environ.get("LAS_REGION"), previous_region)
 
     def test_classify_capture_output_distinguishes_accepted_abnormal_failed(self):
         self.assertEqual(

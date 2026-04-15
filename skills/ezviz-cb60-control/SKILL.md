@@ -22,7 +22,9 @@ The current implementation covers:
 - Logical channel probing for dual-lens validation
 - Local shot-planning workflow for up to 4 clips
 - Recurring OpenClaw task management for daily capture windows
+- First-boot onboarding that only asks the merchant for one capture time window
 - Strict merchant command parsing around the wake word `龙虾`
+- Battery precheck one hour before the next scheduled capture window
 - Daily reporting and capture-session logging
 - Auto-convert recorded clips to rotated MP4 when ffmpeg is available
 - Minute-level status monitoring with local logs and report output
@@ -77,6 +79,18 @@ python3 scripts/ezviz_cb60_control.py setup-env
 source ~/.ezviz_cb60_env
 ```
 
+If OpenClaw is responsible for onboarding the merchant, call this first:
+
+```bash
+python3 scripts/cb60_task_manager.py install-onboarding-message
+```
+
+OpenClaw should send the returned `message_text` to the user immediately after plugin install, collect the required credentials and TOS prefixes, and only then continue to ask:
+
+```text
+你希望这个摄像头在什么时候拍？
+```
+
 The setup wizard actively asks for:
 
 - `EZVIZ_APP_KEY`
@@ -85,6 +99,17 @@ The setup wizard actively asks for:
 - `EZVIZ_DEVICE_SERIAL`
 - `EZVIZ_VALIDATE_CODE`
 - `EZVIZ_CHANNEL_NO`
+
+The wizard now also asks whether to configure LAS/TOS post-processing on the same machine.
+
+If the operator answers yes, it additionally collects:
+
+- `LAS_API_KEY`
+- `LAS_REGION`
+- `TOS_ACCESS_KEY`
+- `TOS_SECRET_KEY`
+- `TOS_BUCKET`
+- `TOS_PREFIX`
 
 If an operator wants to prepare a second camera profile on the same machine:
 
@@ -105,6 +130,28 @@ python3 scripts/cb60_capture_workflow.py --env-file ~/.ezviz_cb60_env_cam2 captu
 ```
 
 This keeps the plugin single-device per invocation while still letting the operator switch between multiple cameras without editing code.
+
+For LAS watermark removal, the workflow now supports an optional env var:
+
+```bash
+export LAS_INPAINT_FIXED_BBOXES='[[0,650,150,970]]'
+```
+
+This uses 1000x1000 normalized coordinates and is tuned for the common "bottom-left timestamp watermark" case. Keep it as-is by default, or adjust it if a different camera places the watermark elsewhere.
+
+For merchant-specific LAS/TOS outputs, configure per-store prefixes such as:
+
+```bash
+export TOS_ORIGINAL='tos://doudou-video/openclaw/store1_jsspa_original/'
+export TOS_FINAL='tos://doudou-video/openclaw/store1_jsspa_final/'
+```
+
+The plugin will derive the merchant slug (`store1_jsspa`) from these prefixes and name cloud videos like:
+
+```text
+store1_jsspa_20260415_101530_original_01.mp4
+store1_jsspa_20260415_101530_final_01.mp4
+```
 
 Common commands:
 
@@ -128,10 +175,21 @@ python3 scripts/cb60_capture_workflow.py init-session --brief '门头, 店内全
 python3 scripts/cb60_capture_workflow.py next-shot --session ./artifacts/workflows/<session>/session.json
 python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/workflows/<session>/session.json --stream-url '<flv-or-hls-url>' --rotation cw90
 python3 scripts/cb60_task_manager.py init-task --task-root ./artifacts/task-manager/store-a --start-time 11:00 --end-time 12:00 --brief '门头, 店内全景'
+python3 scripts/cb60_task_manager.py first-boot-setup --task-root ./artifacts/task-manager/store-a --time-window-text '11:00-12:00'
 python3 scripts/cb60_task_manager.py merchant-command --task ./artifacts/task-manager/store-a/task.json --text '龙虾，怎么没有拍摄，帮我找找问题'
+python3 scripts/cb60_task_manager.py battery-precheck --task ./artifacts/task-manager/store-a/task.json
 python3 scripts/cb60_task_manager.py daily-report --task ./artifacts/task-manager/store-a/task.json --status-root ./artifacts/status-monitor/live
+python3 scripts/cb60_task_manager.py workflow-spec
 python3 scripts/cb60_status_monitor.py run --interval-seconds 60 --max-rounds 5
 ```
+
+For `stream-address`, the managed-stream API protocol mapping is:
+
+- `1 = hls`
+- `2 = rtmp`
+- `3 = flv`
+
+The CLI also accepts legacy `4` and silently treats it as `flv` for backward compatibility.
 
 Run commands from:
 
@@ -160,15 +218,27 @@ Run commands from:
 19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=4`, `quality=1`, `supportH265=1`, and `type=1` so it requests the same fresh FLV address shape that passed real-device validation.
 20. Every workflow capture should append structured logs to `capture-log.jsonl` and refresh `capture-report.md` inside the session folder.
 21. After each capture, validate the resulting file. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
-22. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
-23. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
-24. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
-25. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
-26. Merchant-side interaction must stay inside the fixed boundary: modify capture time, diagnose capture problems, or stop capture. Reject anything else through `merchant-command`.
-27. After each finished capture session, call `record-session` so the plugin can build a real daily report with clip counts and upload counts.
-28. Use `daily-report` for end-of-day summaries and `diagnose-task` when the merchant says “怎么没有拍摄”.
-29. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
-30. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
+22. After an accepted capture, attach a deferred LAS post-process pipeline to the shot metadata. The fixed order is: `upload_to_tos -> las_highlight_edit -> las_video_inpaint -> las_video_resize`.
+23. Until the user provides the required TOS bridge access, keep that LAS pipeline in `pending_config` state. Do not invent TOS credentials or silently upload anything.
+24. If a clip is abnormal or failed, mark the LAS pipeline as `skipped_capture_not_accepted` so later orchestration knows not to send bad media into LAS.
+25. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
+26. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
+27. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
+28. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
+29. For first-boot onboarding, prefer `first-boot-setup` so the merchant only needs to answer one thing: the capture time window.
+30. Merchant-side interaction must stay inside the fixed boundary: modify capture time, start a temporary custom capture window, diagnose capture problems, or stop capture. Reject anything else through `merchant-command`.
+31. Before the next scheduled capture window starts, run `battery-precheck`. If battery is below 85%, return a reminder for the merchant to charge the camera.
+32. After each finished capture session, call `record-session` so the plugin can build a real daily report with clip counts and upload counts.
+33. Use `daily-report` for end-of-day summaries and `diagnose-task` when the merchant says “怎么没有拍摄”.
+34. Treat the plugin as recurring-by-default: once the merchant gives one daily time window, the task repeats every day until the merchant explicitly says `龙虾，停止拍摄` or the backend disables the task.
+35. Keep the first merchant question fixed to `你希望这个摄像头在什么时候拍？` and do not expand onboarding into a broader survey unless the user explicitly asks.
+36. If the merchant says “帮我拍视频” or “从现在开始拍视频”, treat it as a temporary capture request. Ask for two parameters when missing: capture interval and end time. Keep the original recurring daily schedule unchanged.
+37. If the orchestrator needs a machine-readable contract for this behavior, use `cb60_task_manager.py workflow-spec` instead of inventing a parallel command grammar.
+38. The default LAS edit prompt should prefer dynamic business highlights: serving dishes, kitchen prep, front-desk reception or operation, staff movement/interaction, tableware placement, and should remove static empty shots.
+39. The default LAS inpaint step should target visible watermarks and use precise detection by default.
+40. The default LAS resize step should output a 2K portrait result when the clip enters the full post-process chain.
+41. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
+42. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
 
 ## API Notes
 

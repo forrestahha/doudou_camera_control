@@ -135,7 +135,11 @@ class IntervalCaptureTests(unittest.TestCase):
                     },
                 ), \
                 mock.patch("cb60_interval_capture_test.extract_frame", return_value=frame_path), \
-                mock.patch("cb60_interval_capture_test.analyze_failure_frame", return_value="OCR文本=视频编码类型非H264"):
+                mock.patch("cb60_interval_capture_test.analyze_failure_frame", return_value="OCR文本=视频编码类型非H264"), \
+                mock.patch(
+                    "cb60_interval_capture_test.run_las_postprocess_pipeline",
+                    return_value={"status": "skipped_capture_not_accepted"},
+                ):
                 summary = run_interval_capture_test(
                     config=config,
                     artifacts=artifacts,
@@ -151,6 +155,109 @@ class IntervalCaptureTests(unittest.TestCase):
             self.assertIn("视频编码类型非H264", row["text_analysis"])
             report = artifacts.report_md.read_text()
             self.assertIn("Review Needed", report)
+
+    def test_run_interval_capture_test_records_las_paths_when_postprocess_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = IntervalArtifacts.create(Path(tmp) / "run")
+            raw_path = artifacts.clips_dir / "round-01.flv"
+            mp4_path = artifacts.clips_dir / "round-01.mp4"
+            raw_path.write_bytes(b"raw")
+            mp4_path.write_bytes(b"mp4")
+            config = EnvConfig(
+                app_key="a",
+                app_secret="b",
+                access_token="c",
+                device_serial="serial",
+                validate_code="code",
+            )
+
+            with mock.patch("cb60_interval_capture_test.resolve_stream_url", return_value="https://example.com/live.flv"), \
+                mock.patch("cb60_interval_capture_test.record_stream_clip", return_value={"output_path": str(raw_path)}), \
+                mock.patch("cb60_interval_capture_test.transcode_recording_to_mp4", return_value={"ok": True, "output_path": str(mp4_path)}), \
+                mock.patch(
+                    "cb60_interval_capture_test.ffprobe_json",
+                    return_value={
+                        "streams": [
+                            {"codec_type": "video", "codec_name": "h264", "width": 1440, "height": 2560},
+                            {"codec_type": "audio", "codec_name": "aac"},
+                        ],
+                        "format": {"duration": "20.0", "size": "123456"},
+                    },
+                ), \
+                mock.patch(
+                    "cb60_interval_capture_test.run_las_postprocess_pipeline",
+                    return_value={
+                        "status": "completed",
+                        "uploaded_tos_path": "tos://bucket/original/store1_jsspa_20260415_101530_original_01.mp4",
+                        "final_tos_path": "tos://bucket/final/store1_jsspa_20260415_101530_final_01.mp4",
+                    },
+                ):
+                summary = run_interval_capture_test(
+                    config=config,
+                    artifacts=artifacts,
+                    rounds=1,
+                    clip_duration_seconds=20,
+                    interval_seconds=1,
+                )
+
+            row = summary["rounds"][0]
+            self.assertEqual(row["status"], "accepted")
+            self.assertEqual(row["postprocess_status"], "completed")
+            self.assertEqual(row["uploaded_tos_path"], "tos://bucket/original/store1_jsspa_20260415_101530_original_01.mp4")
+            self.assertEqual(row["final_tos_path"], "tos://bucket/final/store1_jsspa_20260415_101530_final_01.mp4")
+            report = artifacts.report_md.read_text()
+            self.assertIn("LAS completed", report)
+
+    def test_run_interval_capture_test_uses_timestamped_file_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = IntervalArtifacts.create(Path(tmp) / "run")
+            config = EnvConfig(
+                app_key="a",
+                app_secret="b",
+                access_token="c",
+                device_serial="serial",
+                validate_code="code",
+            )
+
+            def fake_record_stream_clip(**kwargs):
+                output_path = Path(kwargs["output_path"])
+                output_path.write_bytes(b"raw")
+                return {"output_path": str(output_path)}
+
+            def fake_transcode_recording_to_mp4(input_path: Path, rotation_mode: str = "cw90"):
+                output_path = input_path.with_suffix(".mp4")
+                output_path.write_bytes(b"mp4")
+                return {"ok": True, "output_path": str(output_path)}
+
+            with mock.patch("cb60_interval_capture_test.build_capture_timestamp", return_value="20260414-170000"), \
+                mock.patch("cb60_interval_capture_test.resolve_stream_url", return_value="https://example.com/live.flv"), \
+                mock.patch("cb60_interval_capture_test.record_stream_clip", side_effect=fake_record_stream_clip), \
+                mock.patch("cb60_interval_capture_test.transcode_recording_to_mp4", side_effect=fake_transcode_recording_to_mp4), \
+                mock.patch(
+                    "cb60_interval_capture_test.ffprobe_json",
+                    return_value={
+                        "streams": [
+                            {"codec_type": "video", "codec_name": "h264", "width": 1440, "height": 2560},
+                            {"codec_type": "audio", "codec_name": "aac"},
+                        ],
+                        "format": {"duration": "20.0", "size": "123456"},
+                    },
+                ), \
+                mock.patch(
+                    "cb60_interval_capture_test.run_las_postprocess_pipeline",
+                    return_value={"status": "skipped_capture_not_accepted"},
+                ):
+                summary = run_interval_capture_test(
+                    config=config,
+                    artifacts=artifacts,
+                    rounds=1,
+                    clip_duration_seconds=20,
+                    interval_seconds=1,
+                )
+
+            row = summary["rounds"][0]
+            self.assertTrue(row["raw_output_path"].endswith("round-01-20260414-170000.flv"))
+            self.assertTrue(row["mp4_output_path"].endswith("round-01-20260414-170000.mp4"))
 
 
 if __name__ == "__main__":

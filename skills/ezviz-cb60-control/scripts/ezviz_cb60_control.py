@@ -114,6 +114,31 @@ def load_env_file(path: str) -> Dict[str, str]:
     return values
 
 
+def parse_fixed_bboxes(raw_value: str) -> tuple[tuple[int, int, int, int], ...]:
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return ()
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise EzvizError("LAS_INPAINT_FIXED_BBOXES 必须是 JSON 数组，例如 [[0,920,340,1000]]。") from exc
+    if not isinstance(payload, list):
+        raise EzvizError("LAS_INPAINT_FIXED_BBOXES 必须是 JSON 数组。")
+
+    boxes = []
+    for item in payload:
+        if not isinstance(item, list) or len(item) != 4:
+            raise EzvizError("LAS_INPAINT_FIXED_BBOXES 的每一项都必须是 4 个整数的数组。")
+        try:
+            x1, y1, x2, y2 = (int(value) for value in item)
+        except (TypeError, ValueError) as exc:
+            raise EzvizError("LAS_INPAINT_FIXED_BBOXES 的坐标必须是整数。") from exc
+        if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+            raise EzvizError("LAS_INPAINT_FIXED_BBOXES 坐标必须满足 0 <= x1 < x2 <= 1000 且 0 <= y1 < y2 <= 1000。")
+        boxes.append((x1, y1, x2, y2))
+    return tuple(boxes)
+
+
 def write_env_file(path: Path, values: Dict[str, str]) -> Path:
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,13 +150,32 @@ def write_env_file(path: Path, values: Dict[str, str]) -> Path:
         "EZVIZ_DEVICE_SERIAL",
         "EZVIZ_VALIDATE_CODE",
         "EZVIZ_CHANNEL_NO",
+        "LAS_API_KEY",
+        "LAS_REGION",
+        "TOS_ACCESS_KEY",
+        "TOS_SECRET_KEY",
+        "LAS_INPAINT_FIXED_BBOXES",
+        "TOS_ORIGINAL",
+        "TOS_FINAL",
+        "TOS_BUCKET",
+        "TOS_PREFIX",
     )
     for key in ordered_keys:
+        if key not in values:
+            continue
         value = values.get(key, "")
         lines.append(f"export {key}={value!r}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.chmod(path, 0o600)
     return path
+
+
+def prompt_yes_no(prompt_func: Callable[[str], str], message: str, default: bool = False) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    answer = prompt_func(message + suffix).strip().lower()
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
 
 
 def run_setup_wizard(
@@ -171,20 +215,45 @@ def run_setup_wizard(
     if missing:
         raise EzvizError("安装向导失败，以下字段不能为空: " + ", ".join(missing))
 
-    written_path = write_env_file(target_path, required_values)
+    values_to_write = dict(required_values)
+    configure_las = prompt_yes_no(prompt_func, "是否现在一起配置 LAS/TOS 后处理环境？", default=False)
+    if configure_las:
+        las_api_key = secret_prompt_func("LAS_API_KEY: ").strip()
+        las_region = prompt_func("LAS_REGION (例如 cn-beijing): ").strip()
+        tos_access_key = secret_prompt_func("TOS_ACCESS_KEY: ").strip()
+        tos_secret_key = secret_prompt_func("TOS_SECRET_KEY: ").strip()
+        tos_original = prompt_func("TOS_ORIGINAL (例如 tos://bucket/openclaw/original/): ").strip()
+        tos_final = prompt_func("TOS_FINAL (例如 tos://bucket/openclaw/final/): ").strip()
+
+        las_required = {
+            "LAS_API_KEY": las_api_key,
+            "LAS_REGION": las_region,
+            "TOS_ACCESS_KEY": tos_access_key,
+            "TOS_SECRET_KEY": tos_secret_key,
+            "TOS_ORIGINAL": tos_original,
+            "TOS_FINAL": tos_final,
+        }
+        las_missing = [key for key, value in las_required.items() if not value]
+        if las_missing:
+            raise EzvizError("LAS/TOS 配置未完成，以下字段不能为空: " + ", ".join(las_missing))
+        values_to_write.update(las_required)
+
+    written_path = write_env_file(target_path, values_to_write)
     return {
         "ok": True,
         "env_file": str(written_path),
         "next_step": f"source {written_path}",
-        "keys_written": [
-            "EZVIZ_APP_KEY",
-            "EZVIZ_APP_SECRET",
-            "EZVIZ_ACCESS_TOKEN",
-            "EZVIZ_DEVICE_SERIAL",
-            "EZVIZ_VALIDATE_CODE",
-            "EZVIZ_CHANNEL_NO",
-        ],
+        "keys_written": sorted(values_to_write.keys()),
+        "las_tos_configured": configure_las,
     }
+
+
+def normalize_stream_address_protocol(protocol: int) -> int:
+    if protocol == 4:
+        return 3
+    if protocol not in {1, 2, 3}:
+        raise EzvizError("stream-address protocol must be 1(hls), 2(rtmp), 3(flv); legacy 4 is also accepted as flv.")
+    return protocol
 
 
 def extract_env_file_arg(argv: Optional[Iterable[str]]) -> tuple[list[str], Optional[str]]:
@@ -227,6 +296,15 @@ class EnvConfig:
     managed_stream_support_h265: int = 1
     managed_stream_mute: int = 0
     timeout_seconds: float = 20.0
+    las_api_key: str = ""
+    las_region: str = ""
+    tos_access_key: str = ""
+    tos_secret_key: str = ""
+    las_inpaint_fixed_bboxes: tuple[tuple[int, int, int, int], ...] = ()
+    tos_bucket: str = ""
+    tos_prefix: str = ""
+    tos_original: str = ""
+    tos_final: str = ""
 
     @classmethod
     def from_env(cls, env_file: Optional[str] = None) -> "EnvConfig":
@@ -264,6 +342,15 @@ class EnvConfig:
             managed_stream_support_h265=parse_int_env("EZVIZ_MANAGED_STREAM_SUPPORT_H265", 1),
             managed_stream_mute=parse_int_env("EZVIZ_MANAGED_STREAM_MUTE", 0),
             timeout_seconds=float(env.get("EZVIZ_TIMEOUT_SECONDS", "20").strip() or "20"),
+            las_api_key=env.get("LAS_API_KEY", "").strip(),
+            las_region=env.get("LAS_REGION", "").strip(),
+            tos_access_key=env.get("TOS_ACCESS_KEY", "").strip(),
+            tos_secret_key=env.get("TOS_SECRET_KEY", "").strip(),
+            las_inpaint_fixed_bboxes=parse_fixed_bboxes(env.get("LAS_INPAINT_FIXED_BBOXES", "")),
+            tos_bucket=env.get("TOS_BUCKET", "").strip(),
+            tos_prefix=env.get("TOS_PREFIX", "").strip(),
+            tos_original=env.get("TOS_ORIGINAL", "").strip() or env.get("TOS_PREFIX", "").strip(),
+            tos_final=env.get("TOS_FINAL", "").strip(),
         )
 
     def doctor(self) -> JsonDict:
@@ -276,10 +363,22 @@ class EnvConfig:
             "EZVIZ_APP_SECRET": bool(self.app_secret),
             "EZVIZ_VALIDATE_CODE": bool(self.validate_code),
         }
+        optional_postprocess = {
+            "LAS_API_KEY": bool(self.las_api_key),
+            "LAS_REGION": bool(self.las_region),
+            "TOS_ACCESS_KEY": bool(self.tos_access_key),
+            "TOS_SECRET_KEY": bool(self.tos_secret_key),
+            "LAS_INPAINT_FIXED_BBOXES": bool(self.las_inpaint_fixed_bboxes),
+            "TOS_ORIGINAL": bool(self.tos_original),
+            "TOS_FINAL": bool(self.tos_final),
+            "TOS_BUCKET": bool(self.tos_bucket),
+            "TOS_PREFIX": bool(self.tos_prefix),
+        }
         return {
             "ok": all(required_now.values()),
             "required": required_now,
             "optional": optional_refresh,
+            "optional_postprocess": optional_postprocess,
             "channel_no": self.channel_no,
             "base_url": self.base_url,
             "live_url_path_override": bool(self.live_url_path),
@@ -936,7 +1035,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stream_address_parser = subparsers.add_parser("stream-address", help="Fetch a playback address by streamId.")
     stream_address_parser.add_argument("--stream-id", required=True)
-    stream_address_parser.add_argument("--protocol", type=int, required=True, choices=[1, 2, 3, 4], help="1=ezopen 2=hls 3=rtmp 4=flv")
+    stream_address_parser.add_argument("--protocol", type=int, required=True, choices=[1, 2, 3, 4], help="1=hls 2=rtmp 3=flv (legacy 4 is also treated as flv)")
     stream_address_parser.add_argument("--quality", type=int, default=1, choices=[1, 2])
     stream_address_parser.add_argument("--support-h265", type=int, default=0, choices=[0, 1])
     stream_address_parser.add_argument("--mute", type=int, default=0, choices=[0, 1])
@@ -1049,10 +1148,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         )
         return 0
     if args.command == "stream-address":
+        normalized_protocol = normalize_stream_address_protocol(args.protocol)
         emit_json(
             client.get_stream_address(
                 stream_id=args.stream_id,
-                protocol=args.protocol,
+                protocol=normalized_protocol,
                 quality=args.quality,
                 support_h265=args.support_h265,
                 mute=args.mute,

@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,8 +17,10 @@ from cb60_capture_workflow import (
     RotationMode,
     analyze_failure_frame,
     build_raw_recording_path,
+    build_capture_timestamp,
     record_stream_clip,
     resolve_stream_url,
+    run_las_postprocess_pipeline,
     transcode_recording_to_mp4,
 )
 from ezviz_cb60_control import EnvConfig, EzvizError, extract_env_file_arg
@@ -61,6 +64,7 @@ def ffprobe_json(path: Path) -> JsonDict:
         check=False,
         capture_output=True,
         text=True,
+        errors="replace",
     )
     if completed.returncode != 0:
         return {"error": completed.stderr.strip() or completed.stdout.strip()}
@@ -92,13 +96,12 @@ def classify_clip(metrics: JsonDict, target_duration: int) -> str:
     return "accepted" if duration_ok and portrait_ok and resolution_ok else "abnormal"
 
 
-def append_csv(path: Path, row: JsonDict, fieldnames: Sequence[str]) -> None:
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
+def write_results_csv(path: Path, rows: Sequence[JsonDict], fieldnames: Sequence[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def render_summary(artifacts: IntervalArtifacts, rows: Sequence[JsonDict]) -> JsonDict:
@@ -108,6 +111,8 @@ def render_summary(artifacts: IntervalArtifacts, rows: Sequence[JsonDict]) -> Js
         "accepted_count": sum(1 for row in rows if row["status"] == "accepted"),
         "abnormal_count": sum(1 for row in rows if row["status"] == "abnormal"),
         "failed_count": sum(1 for row in rows if row["status"] not in ("accepted", "abnormal")),
+        "postprocess_completed_count": sum(1 for row in rows if row.get("postprocess_status") == "completed"),
+        "postprocess_failed_count": sum(1 for row in rows if row.get("postprocess_status") == "failed"),
         "rounds": rows,
     }
     artifacts.summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -135,23 +140,27 @@ def render_report(
         f"- Accepted: {len(accepted)}",
         f"- Abnormal: {len(abnormal)}",
         f"- Failed: {len(failed)}",
+        f"- LAS completed: {sum(1 for row in rows if row.get('postprocess_status') == 'completed')}",
+        f"- LAS failed: {sum(1 for row in rows if row.get('postprocess_status') == 'failed')}",
         f"- Average accepted MP4 size: {avg_size} bytes" if accepted else "- Average accepted MP4 size: n/a",
         "",
         "## Latest Rounds",
         "",
-        "| Round | Time | Status | Duration | Resolution | MP4 | Note |",
-        "| --- | --- | --- | ---: | --- | --- | --- |",
+        "| Round | Time | Capture | LAS | Duration | Resolution | MP4 | Final TOS | Note |",
+        "| --- | --- | --- | --- | ---: | --- | --- | --- | --- |",
     ]
     for row in rows[-15:]:
         lines.append(
-            "| {round} | {started_at} | {status} | {duration:.3f} | {width}x{height} | {mp4} | {note} |".format(
+            "| {round} | {started_at} | {status} | {postprocess_status} | {duration:.3f} | {width}x{height} | {mp4} | {final_tos} | {note} |".format(
                 round=row.get("round", ""),
                 started_at=row.get("started_at", ""),
                 status=row.get("status", ""),
+                postprocess_status=row.get("postprocess_status", ""),
                 duration=float(row.get("duration") or 0.0),
                 width=row.get("width", 0),
                 height=row.get("height", 0),
                 mp4=Path(str(row.get("mp4_output_path") or "")).name,
+                final_tos=(row.get("final_tos_path", "") or "").replace("|", "/"),
                 note=row.get("note", ""),
             )
         )
@@ -187,6 +196,7 @@ def extract_frame(input_path: Path, output_path: Path, second: float = 1.0) -> O
         check=False,
         capture_output=True,
         text=True,
+        errors="replace",
     )
     if completed.returncode != 0 or not output_path.exists():
         return None
@@ -202,7 +212,8 @@ def run_interval_capture_test(
     interval_seconds: int,
     rotation_mode: RotationMode = "cw90",
 ) -> JsonDict:
-    rows: List[JsonDict] = []
+    rows: Dict[int, JsonDict] = {}
+    rows_lock = threading.Lock()
     fieldnames = [
         "round",
         "started_at",
@@ -215,15 +226,30 @@ def run_interval_capture_test(
         "height",
         "video_codec",
         "audio_codec",
-        "frame_path",
-        "text_analysis",
-        "status",
+            "frame_path",
+            "text_analysis",
+            "status",
+            "postprocess_status",
+            "uploaded_tos_path",
+            "final_tos_path",
+            "postprocess_note",
         "note",
     ]
 
-    for round_index in range(1, rounds + 1):
+    def refresh_outputs() -> None:
+        ordered_rows = [rows[index] for index in sorted(rows)]
+        write_results_csv(artifacts.results_csv, ordered_rows, fieldnames)
+        render_report(
+            artifacts,
+            rows=ordered_rows,
+            clip_duration_seconds=clip_duration_seconds,
+            interval_seconds=interval_seconds,
+        )
+
+    def execute_round(round_index: int) -> JsonDict:
         round_started = time.time()
         started_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(round_started))
+        capture_timestamp = build_capture_timestamp(round_started)
         row: JsonDict = {
             "round": round_index,
             "started_at": started_at,
@@ -239,6 +265,10 @@ def run_interval_capture_test(
             "frame_path": "",
             "text_analysis": "",
             "status": "failed",
+            "postprocess_status": "",
+            "uploaded_tos_path": "",
+            "final_tos_path": "",
+            "postprocess_note": "",
             "note": "",
         }
 
@@ -246,7 +276,7 @@ def run_interval_capture_test(
             stream_url = resolve_stream_url(config)
             row["stream_url"] = stream_url
             raw_output_path = build_raw_recording_path(
-                artifacts.clips_dir / f"round-{round_index:02d}.ts",
+                artifacts.clips_dir / f"round-{round_index:02d}-{capture_timestamp}.ts",
                 stream_url,
             )
             result = record_stream_clip(
@@ -269,32 +299,69 @@ def run_interval_capture_test(
                 row["status"] = classify_clip(metrics, clip_duration_seconds)
                 row["note"] = "" if row["status"] == "accepted" else "abnormal clip"
                 if row["status"] != "accepted":
-                    frame_path = extract_frame(mp4_path, artifacts.clips_dir / f"round-{round_index:02d}-frame.jpg")
+                    frame_path = extract_frame(
+                        mp4_path,
+                        artifacts.clips_dir / f"round-{round_index:02d}-{capture_timestamp}-frame.jpg",
+                    )
                     if frame_path:
                         row["frame_path"] = str(frame_path)
                         row["text_analysis"] = analyze_failure_frame(frame_path, metrics)
+                postprocess = run_las_postprocess_pipeline(
+                    config=config,
+                    session={
+                        "session_id": artifacts.root.name,
+                        "las_pipeline": {},
+                        "capture_timestamp": capture_timestamp,
+                    },
+                    shot={
+                        "index": round_index,
+                        "shot_id": f"round-{round_index:02d}",
+                        "label": f"Round {round_index:02d}",
+                        "request_text": f"Round {round_index:02d} periodic capture",
+                        "capture_timestamp": capture_timestamp,
+                    },
+                    final_output_path=str(mp4_path),
+                    validation_status=row["status"],
+                    artifacts_root=artifacts.root,
+                )
+                row["postprocess_status"] = postprocess.get("status", "")
+                row["uploaded_tos_path"] = postprocess.get("uploaded_tos_path", "")
+                row["final_tos_path"] = postprocess.get("final_tos_path", "")
+                row["postprocess_note"] = postprocess.get("reason", "")
+                if row["status"] == "accepted" and row["postprocess_status"] == "failed":
+                    row["note"] = row["postprocess_note"] or "las pipeline failed"
         except EzvizError as exc:
             row["status"] = "record_failed"
             row["note"] = str(exc)
+        with rows_lock:
+            rows[round_index] = row
+            refresh_outputs()
+        return row
 
-        rows.append(row)
-        append_csv(artifacts.results_csv, row, fieldnames)
-        render_report(
-            artifacts,
-            rows=rows,
-            clip_duration_seconds=clip_duration_seconds,
-            interval_seconds=interval_seconds,
-        )
-
-        if round_index < rounds:
-            elapsed = time.time() - round_started
-            sleep_seconds = max(0.0, float(interval_seconds) - elapsed)
+    threads: List[threading.Thread] = []
+    suite_started = time.time()
+    for round_index in range(1, rounds + 1):
+        scheduled_at = suite_started + float(interval_seconds) * float(round_index - 1)
+        sleep_seconds = max(0.0, scheduled_at - time.time())
+        if sleep_seconds:
             time.sleep(sleep_seconds)
+        thread = threading.Thread(
+            target=execute_round,
+            args=(round_index,),
+            daemon=True,
+            name=f"cb60-interval-round-{round_index:02d}",
+        )
+        thread.start()
+        threads.append(thread)
 
-    summary = render_summary(artifacts, rows)
+    for thread in threads:
+        thread.join()
+
+    ordered_rows = [rows[index] for index in sorted(rows)]
+    summary = render_summary(artifacts, ordered_rows)
     render_report(
         artifacts,
-        rows=rows,
+        rows=ordered_rows,
         clip_duration_seconds=clip_duration_seconds,
         interval_seconds=interval_seconds,
     )
