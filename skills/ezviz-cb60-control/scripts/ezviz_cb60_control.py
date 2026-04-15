@@ -170,14 +170,6 @@ def write_env_file(path: Path, values: Dict[str, str]) -> Path:
     return path
 
 
-def prompt_yes_no(prompt_func: Callable[[str], str], message: str, default: bool = False) -> bool:
-    suffix = " [Y/n]: " if default else " [y/N]: "
-    answer = prompt_func(message + suffix).strip().lower()
-    if not answer:
-        return default
-    return answer in {"y", "yes"}
-
-
 def run_setup_wizard(
     *,
     output_path: Path,
@@ -216,27 +208,25 @@ def run_setup_wizard(
         raise EzvizError("安装向导失败，以下字段不能为空: " + ", ".join(missing))
 
     values_to_write = dict(required_values)
-    configure_las = prompt_yes_no(prompt_func, "是否现在一起配置 LAS/TOS 后处理环境？", default=False)
-    if configure_las:
-        las_api_key = secret_prompt_func("LAS_API_KEY: ").strip()
-        las_region = prompt_func("LAS_REGION (例如 cn-beijing): ").strip()
-        tos_access_key = secret_prompt_func("TOS_ACCESS_KEY: ").strip()
-        tos_secret_key = secret_prompt_func("TOS_SECRET_KEY: ").strip()
-        tos_original = prompt_func("TOS_ORIGINAL (例如 tos://bucket/openclaw/original/): ").strip()
-        tos_final = prompt_func("TOS_FINAL (例如 tos://bucket/openclaw/final/): ").strip()
+    las_api_key = secret_prompt_func("LAS_API_KEY: ").strip()
+    las_region = prompt_func("LAS_REGION (例如 cn-beijing): ").strip()
+    tos_access_key = secret_prompt_func("TOS_ACCESS_KEY: ").strip()
+    tos_secret_key = secret_prompt_func("TOS_SECRET_KEY: ").strip()
+    tos_original = prompt_func("TOS_ORIGINAL (例如 tos://doudou-video/openclaw/store1_jsspa_original/): ").strip()
+    tos_final = prompt_func("TOS_FINAL (例如 tos://doudou-video/openclaw/store1_jsspa_final/): ").strip()
 
-        las_required = {
-            "LAS_API_KEY": las_api_key,
-            "LAS_REGION": las_region,
-            "TOS_ACCESS_KEY": tos_access_key,
-            "TOS_SECRET_KEY": tos_secret_key,
-            "TOS_ORIGINAL": tos_original,
-            "TOS_FINAL": tos_final,
-        }
-        las_missing = [key for key, value in las_required.items() if not value]
-        if las_missing:
-            raise EzvizError("LAS/TOS 配置未完成，以下字段不能为空: " + ", ".join(las_missing))
-        values_to_write.update(las_required)
+    las_required = {
+        "LAS_API_KEY": las_api_key,
+        "LAS_REGION": las_region,
+        "TOS_ACCESS_KEY": tos_access_key,
+        "TOS_SECRET_KEY": tos_secret_key,
+        "TOS_ORIGINAL": tos_original,
+        "TOS_FINAL": tos_final,
+    }
+    las_missing = [key for key, value in las_required.items() if not value]
+    if las_missing:
+        raise EzvizError("安装向导失败，完整插件链路必须配置火山云 LAS/TOS，以下字段不能为空: " + ", ".join(las_missing))
+    values_to_write.update(las_required)
 
     written_path = write_env_file(target_path, values_to_write)
     return {
@@ -244,7 +234,8 @@ def run_setup_wizard(
         "env_file": str(written_path),
         "next_step": f"source {written_path}",
         "keys_written": sorted(values_to_write.keys()),
-        "las_tos_configured": configure_las,
+        "las_tos_configured": True,
+        "workflow_mode": "full_capture_with_las",
     }
 
 
@@ -354,7 +345,7 @@ class EnvConfig:
         )
 
     def doctor(self) -> JsonDict:
-        required_now = {
+        required_capture = {
             "EZVIZ_DEVICE_SERIAL": bool(self.device_serial),
             "EZVIZ_ACCESS_TOKEN": bool(self.access_token),
         }
@@ -363,22 +354,33 @@ class EnvConfig:
             "EZVIZ_APP_SECRET": bool(self.app_secret),
             "EZVIZ_VALIDATE_CODE": bool(self.validate_code),
         }
-        optional_postprocess = {
+        required_full_workflow = {
             "LAS_API_KEY": bool(self.las_api_key),
             "LAS_REGION": bool(self.las_region),
             "TOS_ACCESS_KEY": bool(self.tos_access_key),
             "TOS_SECRET_KEY": bool(self.tos_secret_key),
-            "LAS_INPAINT_FIXED_BBOXES": bool(self.las_inpaint_fixed_bboxes),
             "TOS_ORIGINAL": bool(self.tos_original),
             "TOS_FINAL": bool(self.tos_final),
+        }
+        optional_postprocess = {
+            "LAS_INPAINT_FIXED_BBOXES": bool(self.las_inpaint_fixed_bboxes),
+        }
+        legacy_compat = {
             "TOS_BUCKET": bool(self.tos_bucket),
             "TOS_PREFIX": bool(self.tos_prefix),
         }
+        capture_ready = all(required_capture.values())
+        full_workflow_ready = capture_ready and all(required_full_workflow.values())
         return {
-            "ok": all(required_now.values()),
-            "required": required_now,
+            "ok": full_workflow_ready,
+            "capture_ready": capture_ready,
+            "full_workflow_ready": full_workflow_ready,
+            "required_capture": required_capture,
+            "required_full_workflow": required_full_workflow,
             "optional": optional_refresh,
             "optional_postprocess": optional_postprocess,
+            "legacy_compat": legacy_compat,
+            "missing_full_workflow": [key for key, value in required_full_workflow.items() if not value],
             "channel_no": self.channel_no,
             "base_url": self.base_url,
             "live_url_path_override": bool(self.live_url_path),

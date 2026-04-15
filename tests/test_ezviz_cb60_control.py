@@ -162,7 +162,9 @@ class EzvizControlTests(unittest.TestCase):
             [
                 "device-9",
                 "1",
-                "no",
+                "cn-beijing",
+                "tos://demo-bucket/openclaw/store1_demo_original/",
+                "tos://demo-bucket/openclaw/store1_demo_final/",
             ]
         )
         secret_answers = iter(
@@ -171,6 +173,9 @@ class EzvizControlTests(unittest.TestCase):
                 "secret-9",
                 "token-9",
                 "verify-9",
+                "las-key-9",
+                "tos-ak-9",
+                "tos-sk-9",
             ]
         )
 
@@ -184,17 +189,20 @@ class EzvizControlTests(unittest.TestCase):
             )
             self.assertTrue(env_path.exists())
             self.assertEqual(payload["env_file"], str(env_path))
-            self.assertFalse(payload["las_tos_configured"])
+            self.assertTrue(payload["las_tos_configured"])
+            self.assertEqual(payload["workflow_mode"], "full_capture_with_las")
             loaded = EnvConfig.from_env(env_file=str(env_path))
             self.assertEqual(loaded.app_key, "key-9")
             self.assertEqual(loaded.device_serial, "device-9")
+            self.assertEqual(loaded.las_api_key, "las-key-9")
+            self.assertEqual(loaded.tos_original, "tos://demo-bucket/openclaw/store1_demo_original/")
+            self.assertEqual(loaded.tos_final, "tos://demo-bucket/openclaw/store1_demo_final/")
 
     def test_run_setup_wizard_can_collect_las_and_tos_fields(self):
         answers = iter(
             [
                 "device-10",
                 "1",
-                "yes",
                 "cn-beijing",
                 "tos://demo-bucket/openclaw/original/",
                 "tos://demo-bucket/openclaw/final/",
@@ -233,7 +241,7 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(normalize_stream_address_protocol(3), 3)
         self.assertEqual(normalize_stream_address_protocol(4), 3)
 
-    def test_doctor_reports_optional_postprocess_fields(self):
+    def test_doctor_reports_required_full_workflow_fields(self):
         config = EnvConfig(
             access_token="token",
             device_serial="serial",
@@ -245,9 +253,23 @@ class EzvizControlTests(unittest.TestCase):
             tos_final="tos://demo-bucket/openclaw/final/",
         )
         payload = config.doctor()
-        self.assertTrue(payload["optional_postprocess"]["LAS_API_KEY"])
-        self.assertTrue(payload["optional_postprocess"]["TOS_ORIGINAL"])
-        self.assertTrue(payload["optional_postprocess"]["TOS_FINAL"])
+        self.assertTrue(payload["capture_ready"])
+        self.assertTrue(payload["full_workflow_ready"])
+        self.assertTrue(payload["required_full_workflow"]["LAS_API_KEY"])
+        self.assertTrue(payload["required_full_workflow"]["TOS_ORIGINAL"])
+        self.assertTrue(payload["required_full_workflow"]["TOS_FINAL"])
+
+    def test_doctor_flags_missing_full_workflow_config(self):
+        config = EnvConfig(
+            access_token="token",
+            device_serial="serial",
+        )
+        payload = config.doctor()
+        self.assertTrue(payload["capture_ready"])
+        self.assertFalse(payload["full_workflow_ready"])
+        self.assertIn("LAS_API_KEY", payload["missing_full_workflow"])
+        self.assertIn("TOS_ORIGINAL", payload["missing_full_workflow"])
+        self.assertIn("TOS_FINAL", payload["missing_full_workflow"])
 
     def test_ptz_pulse_issues_start_and_stop(self):
         requester = FakeRequester(
@@ -501,7 +523,8 @@ class EzvizControlTests(unittest.TestCase):
         self.assertNotIn("ACCESSTOKEN-SECRET-VALUE", dumped)
         self.assertNotIn("DEVICE-SERIAL-VALUE", dumped)
         self.assertNotIn("VALIDATE-CODE-VALUE", dumped)
-        self.assertTrue(doctor["ok"])
+        self.assertTrue(doctor["capture_ready"])
+        self.assertFalse(doctor["full_workflow_ready"])
 
     def test_capabilities_match_verified_runtime(self):
         client = EzvizClient(self.make_config(), requester=FakeRequester({}))

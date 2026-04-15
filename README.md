@@ -93,7 +93,7 @@ OpenClaw 接入时，应该把它理解成下面这 4 层：
 - `EZVIZ_VALIDATE_CODE`
 - `EZVIZ_CHANNEL_NO`
 
-### LAS/TOS 完整后处理必需项
+### 火山云 LAS/TOS 完整后处理必需项
 
 - `LAS_API_KEY`
 - `LAS_REGION`
@@ -140,11 +140,7 @@ python3 scripts/ezviz_cb60_control.py setup-env
 
 ### 安装向导会主动问什么
 
-向导会先问萤石拍摄必需项，然后再问：
-
-- 是否现在一起配置 `LAS/TOS`
-
-如果用户回答 `yes`，它会继续问：
+向导会先问萤石拍摄必需项，然后继续追问完整工作流所需的火山云字段：
 
 - `LAS_API_KEY`
 - `LAS_REGION`
@@ -153,7 +149,7 @@ python3 scripts/ezviz_cb60_control.py setup-env
 - `TOS_ORIGINAL`
 - `TOS_FINAL`
 
-也就是说，**安装后 OpenClaw 不需要自己发明第二套问答逻辑**；只要：
+也就是说，**安装后 OpenClaw 不需要自己发明第二套问答逻辑**；完整插件默认就要求这些字段全部到位。只要：
 
 - 先发资料采集说明
 - 再跑 `setup-env`

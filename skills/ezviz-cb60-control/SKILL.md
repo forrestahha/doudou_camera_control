@@ -100,16 +100,14 @@ The setup wizard actively asks for:
 - `EZVIZ_VALIDATE_CODE`
 - `EZVIZ_CHANNEL_NO`
 
-The wizard now also asks whether to configure LAS/TOS post-processing on the same machine.
-
-If the operator answers yes, it additionally collects:
+The setup wizard now always collects the full Volcano LAS/TOS configuration required by the complete plugin workflow:
 
 - `LAS_API_KEY`
 - `LAS_REGION`
 - `TOS_ACCESS_KEY`
 - `TOS_SECRET_KEY`
-- `TOS_BUCKET`
-- `TOS_PREFIX`
+- `TOS_ORIGINAL`
+- `TOS_FINAL`
 
 If an operator wants to prepare a second camera profile on the same machine:
 
