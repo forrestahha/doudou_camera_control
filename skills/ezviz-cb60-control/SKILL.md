@@ -102,6 +102,8 @@ The setup wizard actively asks for:
 
 `EZVIZ_ACCESS_TOKEN` expires after 7 days. If an EZVIZ request returns `10002`, the controller refreshes the token once with `EZVIZ_APP_KEY` + `EZVIZ_APP_SECRET`, retries the original request, and writes the fresh token back to the same `--env-file` when one is provided. Do not make OpenClaw generate ad-hoc token refresh scripts during normal capture.
 
+Runtime OpenClaw agents must not hot-patch plugin source files. If capture fails because of a bug in `scripts/`, `skills/`, `tests/`, `README.md`, `SOUL.md`, or `openclaw.plugin.json`, stop, record the error, and tell the operator to update the plugin from GitHub. Only the maintainer should modify source in the development repository, run tests, and push a new version.
+
 The setup wizard now always collects the full Volcano LAS/TOS configuration required by the complete plugin workflow:
 
 - `LAS_API_KEY`
