@@ -93,6 +93,8 @@ OpenClaw 接入时，应该把它理解成下面这 4 层：
 - `EZVIZ_VALIDATE_CODE`
 - `EZVIZ_CHANNEL_NO`
 
+`EZVIZ_ACCESS_TOKEN` 有 7 天有效期。插件在调用萤石接口时如果遇到 `10002: accessToken过期或参数异常`，会自动使用 `EZVIZ_APP_KEY` + `EZVIZ_APP_SECRET` 刷新一次 token，并在使用 `--env-file` 时写回同一个环境文件。OpenClaw 不需要现场写脚本刷新 token。
+
 ### 火山云 LAS/TOS 完整后处理必需项
 
 - `LAS_API_KEY`

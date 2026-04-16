@@ -114,6 +114,29 @@ def load_env_file(path: str) -> Dict[str, str]:
     return values
 
 
+def update_env_file_value(path: str, key: str, value: str) -> None:
+    env_path = Path(path).expanduser()
+    if not env_path.exists():
+        raise EzvizError(f"Env file not found: {env_path}")
+    prefix = f"{key}="
+    export_prefix = f"export {key}="
+    replacement = f"export {key}={value!r}"
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    replaced = False
+    next_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix) or stripped.startswith(export_prefix):
+            next_lines.append(replacement)
+            replaced = True
+        else:
+            next_lines.append(line)
+    if not replaced:
+        next_lines.append(replacement)
+    env_path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
+    os.chmod(env_path, 0o600)
+
+
 def parse_fixed_bboxes(raw_value: str) -> tuple[tuple[int, int, int, int], ...]:
     raw_value = raw_value.strip()
     if not raw_value:
@@ -296,11 +319,14 @@ class EnvConfig:
     tos_prefix: str = ""
     tos_original: str = ""
     tos_final: str = ""
+    env_file_path: str = ""
 
     @classmethod
     def from_env(cls, env_file: Optional[str] = None) -> "EnvConfig":
         env = dict(os.environ)
+        resolved_env_file = ""
         if env_file:
+            resolved_env_file = str(Path(env_file).expanduser())
             env.update(load_env_file(env_file))
 
         channel_raw = env.get("EZVIZ_CHANNEL_NO", "1").strip() or "1"
@@ -342,6 +368,7 @@ class EnvConfig:
             tos_prefix=env.get("TOS_PREFIX", "").strip(),
             tos_original=env.get("TOS_ORIGINAL", "").strip() or env.get("TOS_PREFIX", "").strip(),
             tos_final=env.get("TOS_FINAL", "").strip(),
+            env_file_path=resolved_env_file,
         )
 
     def doctor(self) -> JsonDict:
@@ -443,44 +470,68 @@ class EzvizClient:
         query_params: Optional[JsonDict] = None,
         header_params: Optional[JsonDict] = None,
     ) -> JsonDict:
-        encoded = None
-        if form_params:
-            encoded = urllib.parse.urlencode(form_params).encode("utf-8")
+        form_values = dict(form_params or {})
+        query_values = dict(query_params or {})
+        header_values = dict(header_params or {})
 
-        url = join_url(self.config.base_url, path)
-        if query_params:
-            filtered = {key: value for key, value in query_params.items() if value not in (None, "")}
-            if filtered:
-                url += "?" + urllib.parse.urlencode(filtered)
+        for attempt in range(2):
+            encoded = None
+            if form_values:
+                encoded = urllib.parse.urlencode(form_values).encode("utf-8")
 
-        headers = {}
-        if encoded is not None:
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-        if header_params:
-            headers.update({key: str(value) for key, value in header_params.items() if value not in (None, "")})
+            url = join_url(self.config.base_url, path)
+            if query_values:
+                filtered = {key: value for key, value in query_values.items() if value not in (None, "")}
+                if filtered:
+                    url += "?" + urllib.parse.urlencode(filtered)
 
-        request = urllib.request.Request(
-            url,
-            data=encoded,
-            headers=headers,
-            method=method,
-        )
-        payload = self._requester(request, self.config.timeout_seconds)
-        self._ensure_success(payload)
-        return payload
+            headers = {}
+            if encoded is not None:
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+            if header_values:
+                headers.update({key: str(value) for key, value in header_values.items() if value not in (None, "")})
 
-    def _ensure_success(self, payload: JsonDict) -> None:
+            request = urllib.request.Request(
+                url,
+                data=encoded,
+                headers=headers,
+                method=method,
+            )
+            payload = self._requester(request, self.config.timeout_seconds)
+            code, message = self._extract_error(payload)
+            if code == "10002" and attempt == 0 and path != "/api/lapp/token/get":
+                fresh_token = self.get_access_token(force_refresh=True)
+                self._replace_access_token(form_values, query_values, header_values, token=fresh_token)
+                continue
+            if code is not None:
+                raise EzvizError(f"{code}: {message}")
+            return payload
+
+        raise EzvizError("Request failed after accessToken refresh.")
+
+    def _extract_error(self, payload: JsonDict) -> tuple[Optional[str], str]:
         top_code = payload.get("code")
         if top_code is not None and str(top_code) not in {"0", "200"}:
             message = first_nonempty(payload.get("msg"), payload.get("message"), payload.get("detail")) or "API error"
-            raise EzvizError(f"{top_code}: {message}")
+            return str(top_code), str(message)
 
         meta = payload.get("meta")
         if isinstance(meta, dict):
             meta_code = meta.get("code")
             if meta_code is not None and str(meta_code) not in {"0", "200"}:
                 message = first_nonempty(meta.get("msg"), meta.get("message"), meta.get("detail")) or "API error"
-                raise EzvizError(f"{meta_code}: {message}")
+                return str(meta_code), str(message)
+        return None, ""
+
+    def _ensure_success(self, payload: JsonDict) -> None:
+        code, message = self._extract_error(payload)
+        if code is not None:
+            raise EzvizError(f"{code}: {message}")
+
+    def _replace_access_token(self, *param_sets: JsonDict, token: str) -> None:
+        for params in param_sets:
+            if "accessToken" in params:
+                params["accessToken"] = token
 
     def _extract_data(self, payload: JsonDict) -> Any:
         if "data" in payload:
@@ -510,6 +561,8 @@ class EzvizClient:
         if not isinstance(token, str) or not token:
             raise EzvizError("Token refresh succeeded but no access token was returned.")
         self.config.access_token = token
+        if self.config.env_file_path:
+            update_env_file_value(self.config.env_file_path, "EZVIZ_ACCESS_TOKEN", token)
         return token
 
     def _device_params(self, channel_no: Optional[int] = None) -> JsonDict:

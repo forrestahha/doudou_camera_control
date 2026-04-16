@@ -26,6 +26,7 @@ from ezviz_cb60_control import (  # noqa: E402
     join_url,
     normalize_stream_address_protocol,
     run_setup_wizard,
+    update_env_file_value,
     write_env_file,
 )
 
@@ -48,6 +49,24 @@ class FakeRequester:
             raise response
         if response is None:
             raise AssertionError(f"Unexpected URL: {request.full_url}")
+        return response
+
+
+class SequenceRequester:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, request, timeout):
+        body = request.data.decode("utf-8") if request.data else ""
+        params = urllib.parse.parse_qs(body)
+        flat_params = {key: values[-1] for key, values in params.items()}
+        self.calls.append((request.full_url, flat_params, dict(request.headers), timeout))
+        if not self.responses:
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
         return response
 
 
@@ -156,6 +175,21 @@ class EzvizControlTests(unittest.TestCase):
             self.assertIn("export LAS_API_KEY='las-key'", text)
             self.assertIn("export TOS_ORIGINAL='tos://demo-bucket/openclaw/original/'", text)
             self.assertIn("export TOS_FINAL='tos://demo-bucket/openclaw/final/'", text)
+
+    def test_update_env_file_value_preserves_other_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cam.env"
+            path.write_text(
+                "export EZVIZ_ACCESS_TOKEN='old-token'\n"
+                "export EZVIZ_DEVICE_SERIAL='device-1'\n"
+                "export TOS_ORIGINAL='tos://bucket/store_original/'\n",
+                encoding="utf-8",
+            )
+            update_env_file_value(path, "EZVIZ_ACCESS_TOKEN", "new-token")
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("export EZVIZ_ACCESS_TOKEN='new-token'", text)
+            self.assertIn("export EZVIZ_DEVICE_SERIAL='device-1'", text)
+            self.assertIn("export TOS_ORIGINAL='tos://bucket/store_original/'", text)
 
     def test_run_setup_wizard_creates_env_file(self):
         answers = iter(
@@ -382,6 +416,54 @@ class EzvizControlTests(unittest.TestCase):
         payload = client.get_device_info()
         self.assertEqual(payload["device_serial"], "device-1")
         self.assertEqual(payload["raw"]["deviceName"], "CB60")
+
+    def test_access_token_error_refreshes_and_retries_once(self):
+        requester = SequenceRequester(
+            [
+                {"code": "10002", "msg": "accessToken过期或参数异常"},
+                {"code": "200", "data": {"accessToken": "fresh-token"}},
+                {"code": "200", "data": {"deviceName": "CB60"}},
+            ]
+        )
+        config = EnvConfig(
+            app_key="app-key",
+            app_secret="app-secret",
+            access_token="expired-token",
+            device_serial="device-1",
+            channel_no=1,
+            base_url="https://open.ys7.com",
+            timeout_seconds=3,
+        )
+        client = EzvizClient(config, requester=requester)
+        payload = client.get_device_info()
+        self.assertEqual(payload["raw"]["deviceName"], "CB60")
+        self.assertEqual(config.access_token, "fresh-token")
+        self.assertEqual(requester.calls[0][1]["accessToken"], "expired-token")
+        self.assertEqual(requester.calls[1][1]["appKey"], "app-key")
+        self.assertEqual(requester.calls[2][1]["accessToken"], "fresh-token")
+
+    def test_token_refresh_writes_back_to_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "cam.env"
+            env_path.write_text(
+                "export EZVIZ_APP_KEY='app-key'\n"
+                "export EZVIZ_APP_SECRET='app-secret'\n"
+                "export EZVIZ_ACCESS_TOKEN='expired-token'\n"
+                "export EZVIZ_DEVICE_SERIAL='device-1'\n"
+                "export EZVIZ_CHANNEL_NO='1'\n",
+                encoding="utf-8",
+            )
+            requester = SequenceRequester(
+                [
+                    {"code": "10002", "msg": "accessToken过期或参数异常"},
+                    {"code": "200", "data": {"accessToken": "fresh-token"}},
+                    {"code": "200", "data": {"deviceName": "CB60"}},
+                ]
+            )
+            config = EnvConfig.from_env(env_file=str(env_path))
+            client = EzvizClient(config, requester=requester)
+            client.get_device_info()
+            self.assertIn("export EZVIZ_ACCESS_TOKEN='fresh-token'", env_path.read_text(encoding="utf-8"))
 
     def test_get_video_encode_uses_headers_and_query(self):
         requester = FakeRequester(
