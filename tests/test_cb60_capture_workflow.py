@@ -288,6 +288,37 @@ class WorkflowTests(unittest.TestCase):
                 workflow.shutil.which = old_which
                 workflow.subprocess.Popen = old_popen
 
+    def test_record_flv_clip_accepts_nonzero_exit_when_file_exists(self):
+        import cb60_capture_workflow as workflow
+
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.returncode = 1
+
+            def communicate(self, timeout=None):
+                return ("", "End of file")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "clip.flv"
+            output.write_bytes(b"FLV")
+            old_which = workflow.shutil.which
+            old_popen = workflow.subprocess.Popen
+            try:
+                workflow.shutil.which = lambda _: "/opt/homebrew/bin/ffmpeg"
+                workflow.subprocess.Popen = FakePopen
+                result = record_flv_clip(
+                    "https://demo/live.flv",
+                    output,
+                    target_duration=20.0,
+                )
+            finally:
+                workflow.shutil.which = old_which
+                workflow.subprocess.Popen = old_popen
+
+            self.assertEqual(result["ffmpeg_returncode"], 1)
+            self.assertEqual(result["source_protocol"], "flv")
+            self.assertEqual(result["output_path"], str(output))
+
     def test_capture_next_shot_updates_session_file(self):
         playlist = "\n".join(
             [
@@ -343,6 +374,57 @@ class WorkflowTests(unittest.TestCase):
             finally:
                 workflow.fetch_bytes = old_fetcher
                 workflow.record_hls_clip = old_record
+
+    def test_capture_next_shot_retries_hls_when_auto_flv_recording_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = init_session("门头", Path(tmp))
+            session_path = Path(session["storage_root"]) / "session.json"
+            import cb60_capture_workflow as workflow
+
+            old_resolve = workflow.resolve_stream_url
+            old_record = workflow.record_stream_clip
+            try:
+                resolved_urls = iter(["https://demo/live.flv", "https://demo/live.m3u8"])
+                calls = []
+
+                def fake_resolve(*args, **kwargs):
+                    return next(resolved_urls)
+
+                def fake_record(stream_url: str, output_path: Path, *args, **kwargs):
+                    calls.append(stream_url)
+                    if stream_url.endswith(".flv"):
+                        raise RuntimeError("flv failed")
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(b"TS")
+                    return {
+                        "output_path": str(output_path),
+                        "captured_duration_seconds": 15.0,
+                        "segment_count": 1,
+                        "source_protocol": "hls",
+                    }
+
+                workflow.resolve_stream_url = fake_resolve
+                workflow.record_stream_clip = fake_record
+
+                def fake_transcode(input_path: Path, rotation_mode: str):
+                    output_path = input_path.with_suffix(".mp4")
+                    output_path.write_bytes(b"MP4")
+                    return {"ok": True, "output_path": str(output_path), "layout": rotation_mode}
+
+                payload = capture_next_shot(
+                    session_path=session_path,
+                    config=EnvConfig(access_token="t", device_serial="d"),
+                    transcode_func=fake_transcode,
+                    probe_func=lambda _: {"duration_seconds": 15.0, "width": 1080, "height": 1920},
+                )
+            finally:
+                workflow.resolve_stream_url = old_resolve
+                workflow.record_stream_clip = old_record
+
+            self.assertEqual(calls, ["https://demo/live.flv", "https://demo/live.m3u8"])
+            self.assertEqual(payload["captured_shot"]["status"], "captured")
+            log_text = (Path(session["storage_root"]) / "capture-log.jsonl").read_text(encoding="utf-8")
+            self.assertIn("flv_failed_retry_hls", log_text)
 
             reloaded = load_session(session_path)
             self.assertEqual(reloaded["shots"][0]["status"], "captured")

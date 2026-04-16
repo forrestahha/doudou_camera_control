@@ -324,6 +324,10 @@ def stream_url_path(url: str) -> str:
     return urllib.parse.urlparse(url).path.lower()
 
 
+def has_usable_recording(output_path: Path) -> bool:
+    return output_path.exists() and output_path.stat().st_size > 0
+
+
 def record_hls_clip(
     playlist_url: str,
     output_path: Path,
@@ -415,10 +419,10 @@ def record_flv_clip(
         process.kill()
         _, stderr = process.communicate()
 
-    if (process.returncode != 0 and not timed_out) or not output_path.exists():
+    if (process.returncode != 0 and not timed_out) and not has_usable_recording(output_path):
         raise EzvizError(stderr[-500:] if stderr else "ffmpeg failed to record FLV stream.")
 
-    if timed_out and output_path.stat().st_size <= 0:
+    if timed_out and not has_usable_recording(output_path):
         raise EzvizError("ffmpeg timed out before producing a usable FLV recording.")
 
     return {
@@ -427,6 +431,7 @@ def record_flv_clip(
         "segment_count": None,
         "source_protocol": "flv",
         "terminated_on_timeout": timed_out,
+        "ffmpeg_returncode": process.returncode,
     }
 
 
@@ -1264,12 +1269,36 @@ def capture_next_shot(
         ".ts",
     )
     raw_output_path = build_raw_recording_path(base_output_path, effective_stream_url)
-    result = record_stream_clip(
-        stream_url=effective_stream_url,
-        output_path=raw_output_path,
-        target_duration=float(shot["duration_seconds"]),
-        timeout_seconds=config.timeout_seconds,
-    )
+    try:
+        result = record_stream_clip(
+            stream_url=effective_stream_url,
+            output_path=raw_output_path,
+            target_duration=float(shot["duration_seconds"]),
+            timeout_seconds=config.timeout_seconds,
+        )
+    except Exception as exc:
+        if stream_url or protocol_id is not None or not stream_url_path(effective_stream_url).endswith(".flv"):
+            raise
+        fallback_stream_url = resolve_stream_url(config, source=source, protocol_id=1)
+        log_func(
+            session,
+            session_path,
+            "flv_failed_retry_hls",
+            {
+                "shot_index": shot["index"],
+                "shot_id": shot["shot_id"],
+                "reason": str(exc),
+                "fallback_stream_url": fallback_stream_url,
+            },
+        )
+        effective_stream_url = fallback_stream_url
+        raw_output_path = build_raw_recording_path(base_output_path, effective_stream_url)
+        result = record_stream_clip(
+            stream_url=effective_stream_url,
+            output_path=raw_output_path,
+            target_duration=float(shot["duration_seconds"]),
+            timeout_seconds=config.timeout_seconds,
+        )
     conversion = transcode_func(Path(result["output_path"]), rotation_mode)
     final_output_path = result["output_path"]
     if conversion.get("ok") and isinstance(conversion.get("output_path"), str):

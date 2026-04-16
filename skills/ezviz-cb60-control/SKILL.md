@@ -5,6 +5,32 @@ description: Control an EZVIZ or 萤石 CB60 camera when the user wants PTZ left
 
 # Ezviz Cb60 Control
 
+## Runtime Hard Boundary
+
+When this skill runs inside a merchant/OpenClaw workspace, it is an operator, not a maintainer.
+
+Runtime agents must never edit, patch, rewrite, or create plugin source files in the installed workspace, including:
+
+- `scripts/`
+- `skills/`
+- `tests/`
+- `README.md`
+- `SOUL.md`
+- `openclaw.plugin.json`
+- any Git-tracked repository file
+
+Do not use edit/write actions to hot-fix code under paths such as `/root/.openclaw/workspace/doudou_camera_control/...`.
+
+Allowed runtime changes are limited to non-source operational state:
+
+- env files such as `~/.ezviz_cb60_env`
+- task JSON files
+- capture/session artifacts
+- status logs
+- OpenClaw runtime configuration directly required to load this plugin
+
+If a capture fails because of a plugin source bug, stop, record the error, and tell the operator to update the plugin from GitHub. Source fixes must be made in the development repository, tested, committed, and pushed by the maintainer.
+
 ## Overview
 
 Use this skill when the user wants to operate a 萤石 CB60 camera from OpenClaw or Codex. It packages the reusable workflow around a small Python controller script and keeps secrets out of code, files, and shell history.
