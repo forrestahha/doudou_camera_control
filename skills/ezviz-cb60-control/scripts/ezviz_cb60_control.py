@@ -365,10 +365,6 @@ class EnvConfig:
         optional_postprocess = {
             "LAS_INPAINT_FIXED_BBOXES": bool(self.las_inpaint_fixed_bboxes),
         }
-        legacy_compat = {
-            "TOS_BUCKET": bool(self.tos_bucket),
-            "TOS_PREFIX": bool(self.tos_prefix),
-        }
         capture_ready = all(required_capture.values())
         full_workflow_ready = capture_ready and all(required_full_workflow.values())
         return {
@@ -379,7 +375,6 @@ class EnvConfig:
             "required_full_workflow": required_full_workflow,
             "optional": optional_refresh,
             "optional_postprocess": optional_postprocess,
-            "legacy_compat": legacy_compat,
             "missing_full_workflow": [key for key, value in required_full_workflow.items() if not value],
             "channel_no": self.channel_no,
             "base_url": self.base_url,

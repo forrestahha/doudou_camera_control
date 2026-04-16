@@ -270,6 +270,7 @@ class EzvizControlTests(unittest.TestCase):
         self.assertIn("LAS_API_KEY", payload["missing_full_workflow"])
         self.assertIn("TOS_ORIGINAL", payload["missing_full_workflow"])
         self.assertIn("TOS_FINAL", payload["missing_full_workflow"])
+        self.assertNotIn("legacy_compat", payload)
 
     def test_ptz_pulse_issues_start_and_stop(self):
         requester = FakeRequester(
