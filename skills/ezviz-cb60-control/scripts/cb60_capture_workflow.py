@@ -57,6 +57,37 @@ DEFAULT_LAS_RESIZE_MIN_WIDTH = 1440
 DEFAULT_LAS_RESIZE_MAX_WIDTH = 2560
 DEFAULT_LAS_RESIZE_MIN_HEIGHT = 2560
 DEFAULT_LAS_RESIZE_MAX_HEIGHT = 2560
+DEFAULT_CAPTURE_WALL_TIMEOUT_SECONDS = 180.0
+DEFAULT_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS = 1800.0
+
+
+@dataclass
+class WorkflowDeadline:
+    started_at: float
+    timeout_seconds: float
+    mode: str
+
+    def remaining_seconds(self) -> float:
+        return self.timeout_seconds - (time.time() - self.started_at)
+
+    def elapsed_seconds(self) -> float:
+        return time.time() - self.started_at
+
+    def check(self, stage: str) -> None:
+        if self.remaining_seconds() <= 0:
+            raise EzvizError(
+                "Capture workflow timed out during {stage} after {elapsed:.1f}s "
+                "(limit={limit:.1f}s, mode={mode}).".format(
+                    stage=stage,
+                    elapsed=self.elapsed_seconds(),
+                    limit=self.timeout_seconds,
+                    mode=self.mode,
+                )
+            )
+
+    def bounded_timeout(self, requested_seconds: float, stage: str) -> float:
+        self.check(stage)
+        return max(1.0, min(float(requested_seconds), self.remaining_seconds()))
 
 
 ZONE_ORDER = {
@@ -385,6 +416,7 @@ def record_flv_clip(
     stream_url: str,
     output_path: Path,
     target_duration: float,
+    max_runtime_seconds: Optional[float] = None,
 ) -> JsonDict:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
@@ -404,6 +436,8 @@ def record_flv_clip(
         str(output_path),
     ]
     timeout_seconds = max(float(target_duration) + 20.0, 30.0)
+    if max_runtime_seconds is not None:
+        timeout_seconds = max(1.0, min(timeout_seconds, float(max_runtime_seconds)))
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -782,9 +816,13 @@ def wait_for_poll_completion(
     *,
     timeout_seconds: int = 1800,
     interval_seconds: int = 5,
+    deadline: Optional[WorkflowDeadline] = None,
+    stage_label: str = "LAS task",
 ) -> JsonDict:
     started = time.time()
     while True:
+        if deadline:
+            deadline.check(stage_label)
         result = poller()
         metadata = result.get("metadata", {})
         status = metadata.get("task_status")
@@ -796,7 +834,14 @@ def wait_for_poll_completion(
             raise EzvizError(f"LAS task failed: status={status} business_code={business_code} error_msg={error_msg}")
         if time.time() - started > timeout_seconds:
             raise EzvizError(f"LAS task timed out after {timeout_seconds}s; last status={status}")
-        time.sleep(interval_seconds)
+        sleep_seconds = float(interval_seconds)
+        if deadline:
+            sleep_seconds = min(sleep_seconds, max(0.0, deadline.remaining_seconds()))
+        if sleep_seconds <= 0:
+            if deadline:
+                deadline.check(stage_label)
+            raise EzvizError(f"LAS task timed out after {timeout_seconds}s; last status={status}")
+        time.sleep(sleep_seconds)
 
 
 def build_las_task_description(task_label: str, task_text: str) -> str:
@@ -1009,6 +1054,7 @@ def run_las_postprocess_pipeline(
     final_output_path: str,
     validation_status: str,
     artifacts_root: Path,
+    deadline: Optional[WorkflowDeadline] = None,
 ) -> JsonDict:
     if validation_status != "accepted":
         return build_las_postprocess_state(session, shot, final_output_path, validation_status)
@@ -1047,6 +1093,8 @@ def run_las_postprocess_pipeline(
                 steps[index]["reason"] = reason
 
     try:
+        if deadline:
+            deadline.check("TOS upload")
         upload_info = upload_local_file_to_tos(config, source_path, original_tos_url)
         steps[0].update(
             {
@@ -1057,6 +1105,8 @@ def run_las_postprocess_pipeline(
         )
         write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-upload.json", upload_info)
 
+        if deadline:
+            deadline.check("LAS highlight submit")
         edit_module = load_skill_module("las_video_edit_skill", str(LAS_EDIT_SKILL_PATH))
         edit_submit = call_las_skill(
             config,
@@ -1076,8 +1126,10 @@ def run_las_postprocess_pipeline(
                 edit_task_id,
                 region=config.las_region,
             ),
-            timeout_seconds=1800,
+            timeout_seconds=int(deadline.bounded_timeout(1800, "LAS highlight poll")) if deadline else 1800,
             interval_seconds=5,
+            deadline=deadline,
+            stage_label="LAS highlight poll",
         )
 
         write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-edit.json", edit_result)
@@ -1095,6 +1147,8 @@ def run_las_postprocess_pipeline(
             }
         )
 
+        if deadline:
+            deadline.check("LAS inpaint submit")
         inpaint_module = load_skill_module("las_video_inpaint_skill", str(LAS_INPAINT_SKILL_PATH))
         inpaint_submit = call_las_skill(
             config,
@@ -1115,8 +1169,10 @@ def run_las_postprocess_pipeline(
                 region=config.las_region,
                 task_id=inpaint_task_id,
             ),
-            timeout_seconds=1800,
+            timeout_seconds=int(deadline.bounded_timeout(1800, "LAS inpaint poll")) if deadline else 1800,
             interval_seconds=5,
+            deadline=deadline,
+            stage_label="LAS inpaint poll",
         )
 
         write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-inpaint.json", inpaint_result)
@@ -1131,6 +1187,8 @@ def run_las_postprocess_pipeline(
             }
         )
 
+        if deadline:
+            deadline.check("LAS resize submit")
         resize_module = load_skill_module("las_video_resize_skill", str(LAS_RESIZE_SKILL_PATH))
         resize_submit = call_las_skill(
             config,
@@ -1156,8 +1214,10 @@ def run_las_postprocess_pipeline(
                 region=config.las_region,
                 task_id=resize_task_id,
             ),
-            timeout_seconds=1800,
+            timeout_seconds=int(deadline.bounded_timeout(1800, "LAS resize poll")) if deadline else 1800,
             interval_seconds=5,
+            deadline=deadline,
+            stage_label="LAS resize poll",
         )
 
         write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-resize.json", resize_result)
@@ -1204,18 +1264,34 @@ def record_stream_clip(
     output_path: Path,
     target_duration: float,
     timeout_seconds: float,
+    max_runtime_seconds: Optional[float] = None,
 ) -> JsonDict:
     if stream_url_path(stream_url).endswith(".flv"):
         return record_flv_clip(
             stream_url=stream_url,
             output_path=output_path,
             target_duration=target_duration,
+            max_runtime_seconds=max_runtime_seconds,
         )
     return record_hls_clip(
         playlist_url=stream_url,
         output_path=output_path,
         target_duration=target_duration,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=min(timeout_seconds, max_runtime_seconds) if max_runtime_seconds else timeout_seconds,
+        max_wait_seconds=max_runtime_seconds if max_runtime_seconds else 45.0,
+    )
+
+
+def build_capture_deadline(config: EnvConfig, las_enabled: bool) -> WorkflowDeadline:
+    timeout_seconds = (
+        getattr(config, "capture_with_las_wall_timeout_seconds", DEFAULT_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS)
+        if las_enabled
+        else getattr(config, "capture_wall_timeout_seconds", DEFAULT_CAPTURE_WALL_TIMEOUT_SECONDS)
+    )
+    return WorkflowDeadline(
+        started_at=time.time(),
+        timeout_seconds=float(timeout_seconds),
+        mode="capture_with_las" if las_enabled else "capture_only",
     )
 
 
@@ -1242,7 +1318,33 @@ def capture_next_shot(
             "summary": session_summary(session),
         }
 
+    las_enabled = has_las_postprocess_config(config)
+    deadline = build_capture_deadline(config, las_enabled)
+
+    def check_deadline(stage: str) -> None:
+        try:
+            deadline.check(stage)
+        except EzvizError as exc:
+            log_func(
+                session,
+                session_path,
+                "capture_timed_out",
+                {
+                    "shot_index": shot["index"],
+                    "shot_id": shot["shot_id"],
+                    "stage": stage,
+                    "reason": str(exc),
+                    "elapsed_seconds": round(deadline.elapsed_seconds(), 3),
+                    "timeout_seconds": deadline.timeout_seconds,
+                    "mode": deadline.mode,
+                },
+            )
+            save_session(session_path, session)
+            raise
+
+    check_deadline("resolve stream")
     effective_stream_url = stream_url or resolve_stream_url(config, source=source, protocol_id=protocol_id)
+    check_deadline("start recording")
     capture_timestamp = build_capture_timestamp()
     log_path = log_func(
         session,
@@ -1258,6 +1360,10 @@ def capture_next_shot(
                 "quality": DEFAULT_LIVE_QUALITY,
                 "support_h265": DEFAULT_LIVE_SUPPORT_H265,
                 "type": DEFAULT_LIVE_ADDRESS_TYPE,
+            },
+            "wall_timeout": {
+                "mode": deadline.mode,
+                "timeout_seconds": deadline.timeout_seconds,
             },
         },
     )
@@ -1275,11 +1381,16 @@ def capture_next_shot(
             output_path=raw_output_path,
             target_duration=float(shot["duration_seconds"]),
             timeout_seconds=config.timeout_seconds,
+            max_runtime_seconds=deadline.bounded_timeout(max(float(shot["duration_seconds"]) + 20.0, 30.0), "record stream"),
         )
     except Exception as exc:
+        if deadline.remaining_seconds() <= 0:
+            check_deadline("record stream")
         if stream_url or protocol_id is not None or not stream_url_path(effective_stream_url).endswith(".flv"):
             raise
+        check_deadline("resolve fallback stream")
         fallback_stream_url = resolve_stream_url(config, source=source, protocol_id=1)
+        check_deadline("record fallback stream")
         log_func(
             session,
             session_path,
@@ -1298,8 +1409,11 @@ def capture_next_shot(
             output_path=raw_output_path,
             target_duration=float(shot["duration_seconds"]),
             timeout_seconds=config.timeout_seconds,
+            max_runtime_seconds=deadline.bounded_timeout(max(float(shot["duration_seconds"]) + 20.0, 30.0), "record fallback stream"),
         )
+    check_deadline("transcode recording")
     conversion = transcode_func(Path(result["output_path"]), rotation_mode)
+    check_deadline("probe recording")
     final_output_path = result["output_path"]
     if conversion.get("ok") and isinstance(conversion.get("output_path"), str):
         final_output_path = conversion["output_path"]
@@ -1310,6 +1424,7 @@ def capture_next_shot(
     frame_path: Optional[Path] = None
     failure_analysis = ""
     if validation_status != "accepted" and inspection_path.exists():
+        check_deadline("extract failure frame")
         frame_path = extract_frame_func(
             inspection_path,
             build_timestamped_shot_path(
@@ -1323,7 +1438,7 @@ def capture_next_shot(
         )
         failure_analysis = analyze_failure_func(frame_path, metrics)
 
-    if has_las_postprocess_config(config):
+    if las_enabled:
         session.setdefault("las_pipeline", {})["execution_mode"] = "inline_after_capture"
         session["las_pipeline"].setdefault("required_bridge", {})
         session["las_pipeline"]["required_bridge"]["status"] = "configured"
@@ -1345,7 +1460,9 @@ def capture_next_shot(
         final_output_path=final_output_path,
         validation_status=validation_status,
         artifacts_root=session_path.parent,
+        deadline=deadline,
     )
+    check_deadline("save workflow result")
     save_session(session_path, session)
     report_path = report_func(session, session_path)
     log_func(
@@ -1360,6 +1477,11 @@ def capture_next_shot(
             "validation": captured["validation"],
             "postprocess": captured["postprocess"],
             "final_output_path": final_output_path,
+            "elapsed_seconds": round(deadline.elapsed_seconds(), 3),
+            "wall_timeout": {
+                "mode": deadline.mode,
+                "timeout_seconds": deadline.timeout_seconds,
+            },
         },
     )
 

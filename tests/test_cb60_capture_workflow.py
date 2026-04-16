@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -443,6 +444,45 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(reloaded["shots"][0]["postprocess"]["steps"][1]["step"], "las_highlight_edit")
             self.assertTrue(Path(payload["workflow_log_path"]).exists())
             self.assertTrue(Path(payload["workflow_report_path"]).exists())
+
+    def test_capture_next_shot_stops_when_wall_timeout_is_exceeded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = init_session("门头", Path(tmp))
+            session_path = Path(session["storage_root"]) / "session.json"
+            import cb60_capture_workflow as workflow
+
+            old_record = workflow.record_stream_clip
+            try:
+                def fake_record(stream_url: str, output_path: Path, *args, **kwargs):
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(b"FLV")
+                    time.sleep(0.02)
+                    return {
+                        "output_path": str(output_path),
+                        "captured_duration_seconds": 15.0,
+                        "segment_count": None,
+                        "source_protocol": "flv",
+                    }
+
+                workflow.record_stream_clip = fake_record
+
+                with self.assertRaisesRegex(Exception, "Capture workflow timed out"):
+                    capture_next_shot(
+                        session_path=session_path,
+                        config=EnvConfig(
+                            access_token="t",
+                            device_serial="d",
+                            capture_wall_timeout_seconds=0.001,
+                        ),
+                        stream_url="https://demo/live.flv",
+                    )
+            finally:
+                workflow.record_stream_clip = old_record
+
+            log_text = (Path(session["storage_root"]) / "capture-log.jsonl").read_text(encoding="utf-8")
+            self.assertIn("capture_timed_out", log_text)
+            reloaded = load_session(session_path)
+            self.assertEqual(reloaded["shots"][0]["status"], "pending")
 
     def test_capture_next_shot_falls_back_when_mp4_conversion_is_unavailable(self):
         playlist = "\n".join(

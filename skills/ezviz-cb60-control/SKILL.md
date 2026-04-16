@@ -248,25 +248,26 @@ Run commands from:
 21. After each capture, validate the resulting file. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
 22. After an accepted capture, attach a deferred LAS post-process pipeline to the shot metadata. The fixed order is: `upload_to_tos -> las_highlight_edit -> las_video_inpaint -> las_video_resize`.
 23. Until the user provides the required TOS bridge access, keep that LAS pipeline in `pending_config` state. Do not invent TOS credentials or silently upload anything.
-24. If a clip is abnormal or failed, mark the LAS pipeline as `skipped_capture_not_accepted` so later orchestration knows not to send bad media into LAS.
-25. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
-26. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
-27. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
-28. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
-29. For first-boot onboarding, prefer `first-boot-setup` so the merchant only needs to answer one thing: the capture time window.
-30. Merchant-side interaction must stay inside the fixed boundary: modify capture time, start a temporary custom capture window, diagnose capture problems, or stop capture. Reject anything else through `merchant-command`.
-31. Before the next scheduled capture window starts, run `battery-precheck`. If battery is below 85%, return a reminder for the merchant to charge the camera.
-32. After each finished capture session, call `record-session` so the plugin can build a real daily report with clip counts and upload counts.
-33. Use `daily-report` for end-of-day summaries and `diagnose-task` when the merchant says “怎么没有拍摄”.
-34. Treat the plugin as recurring-by-default: once the merchant gives one daily time window, the task repeats every day until the merchant explicitly says `龙虾，停止拍摄` or the backend disables the task.
-35. Keep the first merchant question fixed to `你希望这个摄像头在什么时候拍？` and do not expand onboarding into a broader survey unless the user explicitly asks.
-36. If the merchant says “帮我拍视频” or “从现在开始拍视频”, treat it as a temporary capture request. Ask for two parameters when missing: capture interval and end time. Keep the original recurring daily schedule unchanged.
-37. If the orchestrator needs a machine-readable contract for this behavior, use `cb60_task_manager.py workflow-spec` instead of inventing a parallel command grammar.
-38. The default LAS edit prompt should prefer dynamic business highlights: serving dishes, kitchen prep, front-desk reception or operation, staff movement/interaction, tableware placement, and should remove static empty shots.
-39. The default LAS inpaint step should target visible watermarks and use precise detection by default.
-40. The default LAS resize step should output a 2K portrait result when the clip enters the full post-process chain.
-41. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
-42. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
+24. Enforce wall-clock runtime limits for every `capture-shot`: default `CB60_CAPTURE_WALL_TIMEOUT_SECONDS=180` for capture-only runs and `CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS=1800` when LAS/TOS is configured. If the deadline is hit, stop, write `capture_timed_out`, and report the failure instead of debugging or retrying indefinitely.
+25. If a clip is abnormal or failed, mark the LAS pipeline as `skipped_capture_not_accepted` so later orchestration knows not to send bad media into LAS.
+26. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
+27. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
+28. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
+29. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
+30. For first-boot onboarding, prefer `first-boot-setup` so the merchant only needs to answer one thing: the capture time window.
+31. Merchant-side interaction must stay inside the fixed boundary: modify capture time, start a temporary custom capture window, diagnose capture problems, or stop capture. Reject anything else through `merchant-command`.
+32. Before the next scheduled capture window starts, run `battery-precheck`. If battery is below 85%, return a reminder for the merchant to charge the camera.
+33. After each finished capture session, call `record-session` so the plugin can build a real daily report with clip counts and upload counts.
+34. Use `daily-report` for end-of-day summaries and `diagnose-task` when the merchant says “怎么没有拍摄”.
+35. Treat the plugin as recurring-by-default: once the merchant gives one daily time window, the task repeats every day until the merchant explicitly says `龙虾，停止拍摄` or the backend disables the task.
+36. Keep the first merchant question fixed to `你希望这个摄像头在什么时候拍？` and do not expand onboarding into a broader survey unless the user explicitly asks.
+37. If the merchant says “帮我拍视频” or “从现在开始拍视频”, treat it as a temporary capture request. Ask for two parameters when missing: capture interval and end time. Keep the original recurring daily schedule unchanged.
+38. If the orchestrator needs a machine-readable contract for this behavior, use `cb60_task_manager.py workflow-spec` instead of inventing a parallel command grammar.
+39. The default LAS edit prompt should prefer dynamic business highlights: serving dishes, kitchen prep, front-desk reception or operation, staff movement/interaction, tableware placement, and should remove static empty shots.
+40. The default LAS inpaint step should target visible watermarks and use precise detection by default.
+41. The default LAS resize step should output a 2K portrait result when the clip enters the full post-process chain.
+42. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
+43. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
 
 ## API Notes
 

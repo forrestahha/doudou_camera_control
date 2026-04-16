@@ -317,7 +317,15 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
     - LAS 高光剪辑
     - LAS 去水印
     - LAS 变高清
-12. 本地文件和云上文件都会带拍摄时间戳
+12. 单次执行有墙钟上限：默认普通拍摄最多 `180` 秒，含 LAS 全流程最多 `1800` 秒；超时会写入 `capture_timed_out` 日志并停止
+13. 本地文件和云上文件都会带拍摄时间戳
+
+可通过环境变量调整上限：
+
+```bash
+export CB60_CAPTURE_WALL_TIMEOUT_SECONDS='180'
+export CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS='1800'
+```
 
 ### LAS 后处理固定策略
 

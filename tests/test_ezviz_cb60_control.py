@@ -275,6 +275,27 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(normalize_stream_address_protocol(3), 3)
         self.assertEqual(normalize_stream_address_protocol(4), 3)
 
+    def test_env_config_reads_capture_wall_timeouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "timeouts.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "EZVIZ_ACCESS_TOKEN='token'",
+                        "EZVIZ_DEVICE_SERIAL='serial'",
+                        "CB60_CAPTURE_WALL_TIMEOUT_SECONDS='120'",
+                        "CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS='900'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = EnvConfig.from_env(env_file=str(env_path))
+
+        self.assertEqual(config.capture_wall_timeout_seconds, 120.0)
+        self.assertEqual(config.capture_with_las_wall_timeout_seconds, 900.0)
+        self.assertEqual(config.doctor()["workflow_timeouts"]["capture_wall_timeout_seconds"], 120.0)
+
     def test_doctor_reports_required_full_workflow_fields(self):
         config = EnvConfig(
             access_token="token",

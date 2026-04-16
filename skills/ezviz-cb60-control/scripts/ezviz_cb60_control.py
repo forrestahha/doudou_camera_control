@@ -320,6 +320,8 @@ class EnvConfig:
     tos_original: str = ""
     tos_final: str = ""
     env_file_path: str = ""
+    capture_wall_timeout_seconds: float = 180.0
+    capture_with_las_wall_timeout_seconds: float = 1800.0
 
     @classmethod
     def from_env(cls, env_file: Optional[str] = None) -> "EnvConfig":
@@ -341,6 +343,16 @@ class EnvConfig:
                 return int(raw)
             except ValueError as exc:
                 raise EzvizError(f"{name} must be an integer.") from exc
+
+        def parse_float_env(name: str, default: float) -> float:
+            raw = env.get(name, str(default)).strip() or str(default)
+            try:
+                value = float(raw)
+            except ValueError as exc:
+                raise EzvizError(f"{name} must be a number.") from exc
+            if value <= 0:
+                raise EzvizError(f"{name} must be greater than 0.")
+            return value
 
         return cls(
             app_key=env.get("EZVIZ_APP_KEY", "").strip(),
@@ -369,6 +381,8 @@ class EnvConfig:
             tos_original=env.get("TOS_ORIGINAL", "").strip() or env.get("TOS_PREFIX", "").strip(),
             tos_final=env.get("TOS_FINAL", "").strip(),
             env_file_path=resolved_env_file,
+            capture_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WALL_TIMEOUT_SECONDS", 180.0),
+            capture_with_las_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS", 1800.0),
         )
 
     def doctor(self) -> JsonDict:
@@ -409,6 +423,10 @@ class EnvConfig:
             "live_source_override": bool(self.live_source),
             "manual_live_url_override": bool(self.manual_live_url),
             "managed_stream_override": bool(self.managed_stream_id),
+            "workflow_timeouts": {
+                "capture_wall_timeout_seconds": self.capture_wall_timeout_seconds,
+                "capture_with_las_wall_timeout_seconds": self.capture_with_las_wall_timeout_seconds,
+            },
         }
 
 
