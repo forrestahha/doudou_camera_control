@@ -60,7 +60,8 @@ DEFAULT_LAS_RESIZE_MAX_WIDTH = 2560
 DEFAULT_LAS_RESIZE_MIN_HEIGHT = 2560
 DEFAULT_LAS_RESIZE_MAX_HEIGHT = 2560
 DEFAULT_CAPTURE_WALL_TIMEOUT_SECONDS = 180.0
-DEFAULT_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS = 1800.0
+DEFAULT_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS = 5400.0
+DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS = 3600.0
 
 
 @dataclass
@@ -838,7 +839,7 @@ def call_las_skill(config: EnvConfig, func: Callable[..., JsonDict], *args: Any,
 def wait_for_poll_completion(
     poller: Callable[[], JsonDict],
     *,
-    timeout_seconds: int = 1800,
+    timeout_seconds: int = int(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS),
     interval_seconds: int = 5,
     deadline: Optional[WorkflowDeadline] = None,
     stage_label: str = "LAS task",
@@ -1150,7 +1151,9 @@ def run_las_postprocess_pipeline(
                 edit_task_id,
                 region=config.las_region,
             ),
-            timeout_seconds=int(deadline.bounded_timeout(1800, "LAS highlight poll")) if deadline else 1800,
+            timeout_seconds=int(deadline.bounded_timeout(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS, "LAS highlight poll"))
+            if deadline
+            else int(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS),
             interval_seconds=5,
             deadline=deadline,
             stage_label="LAS highlight poll",
@@ -1193,7 +1196,9 @@ def run_las_postprocess_pipeline(
                 region=config.las_region,
                 task_id=inpaint_task_id,
             ),
-            timeout_seconds=int(deadline.bounded_timeout(1800, "LAS inpaint poll")) if deadline else 1800,
+            timeout_seconds=int(deadline.bounded_timeout(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS, "LAS inpaint poll"))
+            if deadline
+            else int(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS),
             interval_seconds=5,
             deadline=deadline,
             stage_label="LAS inpaint poll",
@@ -1238,7 +1243,9 @@ def run_las_postprocess_pipeline(
                 region=config.las_region,
                 task_id=resize_task_id,
             ),
-            timeout_seconds=int(deadline.bounded_timeout(1800, "LAS resize poll")) if deadline else 1800,
+            timeout_seconds=int(deadline.bounded_timeout(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS, "LAS resize poll"))
+            if deadline
+            else int(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS),
             interval_seconds=5,
             deadline=deadline,
             stage_label="LAS resize poll",

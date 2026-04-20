@@ -354,7 +354,7 @@ class EnvConfig:
     tos_final: str = ""
     env_file_path: str = ""
     capture_wall_timeout_seconds: float = 180.0
-    capture_with_las_wall_timeout_seconds: float = 1800.0
+    capture_with_las_wall_timeout_seconds: float = 5400.0
 
     @classmethod
     def from_env(cls, env_file: Optional[str] = None) -> "EnvConfig":
@@ -415,7 +415,7 @@ class EnvConfig:
             tos_final=env.get("TOS_FINAL", "").strip(),
             env_file_path=resolved_env_file,
             capture_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WALL_TIMEOUT_SECONDS", 180.0),
-            capture_with_las_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS", 1800.0),
+            capture_with_las_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS", 5400.0),
         )
 
     def doctor(self) -> JsonDict:
