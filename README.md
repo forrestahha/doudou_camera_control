@@ -275,6 +275,39 @@ python3 scripts/ezviz_cb60_control.py doctor
    - `record-session`
    - `daily-report`
 
+### 首次安装到自动拍摄的最小闭环
+
+如果你要让一台新机器上的 OpenClaw “装完就能按时自动拍”，最小闭环就是下面这套顺序：
+
+1. 安装插件并进入 skill 目录
+2. 调 `install-onboarding-message`，把返回的资料采集说明发给用户
+3. 跑 `setup-env` 写入萤石和 LAS/TOS 环境变量
+4. 跑 `doctor` 和 `tos-preflight`，确认运行环境没缺依赖、没缺 bucket/网络
+5. 问商家唯一那句：`你希望这个摄像头在什么时候拍？`
+6. 调 `first-boot-setup`
+7. 立刻调 `scheduler-spec`
+8. OpenClaw 根据 `scheduler-spec` 创建每 10 分钟一次的周期任务
+9. 创建完成后回写 `scheduler-installed`
+10. 之后才算真正进入“每天自动拍摄”
+
+也就是说，**只写 `task.json` 还不够**，必须真的把 OpenClaw 周期调度器建起来。
+
+推荐直接照着执行：
+
+```bash
+python3 scripts/cb60_task_manager.py first-boot-setup \
+  --task-root ./artifacts/task-manager/store-a \
+  --time-window-text '11:00-12:00'
+
+python3 scripts/cb60_task_manager.py scheduler-spec \
+  --task ./artifacts/task-manager/store-a/task.json
+
+python3 scripts/cb60_task_manager.py scheduler-installed \
+  --task ./artifacts/task-manager/store-a/task.json \
+  --automation-name doudou_camera_shot_check_store_a \
+  --delivery-channel main-session-channel
+```
+
 ## 常用命令
 
 在目录
@@ -306,6 +339,61 @@ python3 scripts/cb60_status_monitor.py run --interval-seconds 60 --max-rounds 5
   - `3=flv`
 - 为了兼容旧调用，CLI 里如果传了 `4`，也会自动按 `flv` 处理
 
+## OpenClaw 推荐默认拍摄策略
+
+OpenClaw 不应该在现场临时猜这些参数，也不应该边跑边改源码。插件当前已经把默认拍摄策略固化好了：
+
+### 1. 默认优先链路
+
+- 优先尝试 `FLV`
+- 默认参数：
+  - `protocol=4`
+  - `quality=1`
+  - `supportH265=0`
+  - `type=1`
+
+这样做的目的，是先优先请求 **H264 兼容链路**，尽量避免直接拿到萤石的 H265 占位图。
+
+### 2. `source` 参数自动兼容
+
+不同萤石接口环境对 `source` 的要求不一致，插件已经做了自适应处理：
+
+- 如果接口返回 `source为空`
+  - 插件会自动补 `source=1` 再试
+- 如果接口返回 `source格式非法`
+  - 插件会自动去掉 `source` 再试
+
+OpenClaw 不需要现场手动判断到底该不该传 `source`。
+
+### 3. 首次拍摄异常时的自动救援
+
+如果第一次拍出来的是下面这几类结果：
+
+- 极低分辨率
+- 明显异常短片
+- 未通过验片
+- 很像拿到了占位图或兼容子流
+
+插件会自动再试一次：
+
+- `H265 + HLS`
+- 即：
+  - `protocol=1`
+  - `supportH265=1`
+
+只有第二次验片通过，才会把第二次结果作为最终结果保留下来。  
+所以 OpenClaw 现在不应该再自己去做“先改环境变量、再手动重建流、再手动切协议”这类现场判断。
+
+### 4. 最终交付格式
+
+不管上游实际拉到的是 H264 还是 H265，插件的最终目标都是：
+
+- 尽可能拿到完整可用的原始画面
+- 再本地转码成竖屏 `MP4`
+- 最终交付给业务侧的是更通用的 `H264 MP4`
+
+所以“最终输出要 H264”和“上游必要时允许 H265 主码流救援”并不冲突。
+
 ## 视频拍摄工作流
 
 ```bash
@@ -334,6 +422,36 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
     - LAS 变高清
 13. 单次执行有墙钟上限：默认普通拍摄最多 `180` 秒，含 LAS 全流程最多 `1800` 秒；超时会写入 `capture_timed_out` 日志并停止
 14. 本地文件和云上文件都会带拍摄时间戳
+
+### 插件已经自动处理的常见拍摄异常
+
+OpenClaw 看到下面这些情况时，不应该第一反应是自己改代码或改一堆环境变量；插件已经内置了处理逻辑：
+
+1. `10001: source为空`
+- 插件会自动补 `source=1` 重试
+
+2. `10001: source格式非法`
+- 插件会自动去掉 `source` 重试
+
+3. `FLV` 录制超时 / 连不上
+- 插件原本就会在合适场景下回退到 `HLS`
+
+4. 第一次拍到的流分辨率过低、时长过短、验片失败
+- 插件会自动再尝试一次 `H265 + HLS`
+
+5. 运行环境缺少 TOS Python SDK
+- `tos-preflight` 会明确告诉你缺的是 Python 包 `tos`
+- 不要让 OpenClaw 在现场猜包名并尝试 `pip install`
+
+### 仍需要人工介入的情况
+
+下面这些不属于插件现场自动修复范围，应该记日志并提示排查环境或设备：
+
+- 萤石控制面 API 本身不可用
+- 当前运行环境完全拉不到媒体流
+- TOS endpoint DNS 或 bucket 鉴权失败
+- 设备电量过低、设备离线
+- LAS 技能或运行依赖压根不存在
 
 可通过环境变量调整上限：
 
@@ -477,6 +595,15 @@ OpenClaw 每天都按这条固定顺序跑：
 5. 拍完调用 `record-session`
 6. 按天调用 `daily-report`
 
+这里“到点自动拍”的前提是：
+
+- `first-boot-setup` 已执行
+- `scheduler-spec` 已读取
+- OpenClaw 周期任务已经真的创建完成
+- `scheduler-installed` 已回写
+
+如果只写了任务配置，但没有真的创建周期检查任务，那么到时间也不会自动拍摄。
+
 ### 3.1 临时拍摄模式
 
 如果商家临时说：
@@ -515,6 +642,7 @@ OpenClaw 在运行 `should-run-now` 时，现在要同时判断两件事：
 - `quality=1`
 - `supportH265=0`
 - `source` 自适应重试：先按现有配置请求，必要时补 `1` 或自动去掉
+- 如果第一次低质量 / 异常短片 / 验片失败：自动重试一次 `H265 + HLS`
 - `type=1`
 
 默认 LAS 规则固定为：
