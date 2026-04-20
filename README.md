@@ -157,6 +157,10 @@ python3 scripts/cb60_task_manager.py install-onboarding-message
 3. 再执行安装向导：
 
 ```bash
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-edit --agent openclaw
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-resize --agent openclaw
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-inpaint --agent openclaw
+
 python3 scripts/ezviz_cb60_control.py setup-env
 ```
 
@@ -274,17 +278,29 @@ python3 scripts/ezviz_cb60_control.py doctor
 1. 插件安装完成
 2. 调 `install-onboarding-message`
 3. 把 `message_text` 发给用户，收齐配置
-4. 跑 `setup-env`
-5. 再问：
+4. 默认先安装 3 个 LAS skill：
+   - `byted-las-video-edit`
+   - `byted-las-video-resize`
+   - `byted-las-video-inpaint`
+5. 跑 `setup-env`
+6. 再问：
    - `你希望这个摄像头在什么时候拍？`
-6. 用 `first-boot-setup` 创建每日重复任务
-7. 立刻根据 `scheduler_spec` 给 OpenClaw 创建周期检查定时任务
-8. 日常由 OpenClaw 周期执行：
+7. 用 `first-boot-setup` 创建每日重复任务
+8. 立刻根据 `scheduler_spec` 给 OpenClaw 创建周期检查定时任务
+9. 日常由 OpenClaw 周期执行：
    - `battery-precheck`
    - `should-run-now`
    - `capture workflow`
    - `record-session`
    - `daily-report`
+
+推荐安装命令就是这 3 条：
+
+```bash
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-edit --agent openclaw
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-resize --agent openclaw
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-inpaint --agent openclaw
+```
 
 ### 首次安装到自动拍摄的最小闭环
 

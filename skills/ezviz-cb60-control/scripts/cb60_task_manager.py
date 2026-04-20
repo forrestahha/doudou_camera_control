@@ -20,6 +20,11 @@ DEFAULT_PRECHECK_LEAD_MINUTES = 60
 DEFAULT_CUSTOM_CAPTURE_INTERVAL_MINUTES = 10
 DEFAULT_CUSTOM_CLIP_DURATION_SECONDS = 20
 DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES = 10
+DEFAULT_LAS_SKILL_INSTALL_COMMANDS = [
+    "npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-edit --agent openclaw",
+    "npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-resize --agent openclaw",
+    "npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-inpaint --agent openclaw",
+]
 
 
 def build_scheduler_state() -> JsonDict:
@@ -75,10 +80,12 @@ def workflow_spec() -> JsonDict:
         "installation_onboarding": {
             "send_message_after_install": True,
             "next_step_after_requirements": "收齐安装信息后，再向商家追问“你希望这个摄像头在什么时候拍？”。",
+            "default_skill_install_commands": DEFAULT_LAS_SKILL_INSTALL_COMMANDS,
             "runtime_prerequisites": [
                 "运行环境需要预装 ffmpeg。",
                 "运行环境需要预装 tesseract-ocr，供异常帧 OCR 分析使用。",
                 "完整云上链路还需要预装 Python 包 tos。",
+                "首次安装插件后，默认先安装 3 个 LAS skill：高光剪辑、去水印、变高清。",
             ],
         },
         "merchant_onboarding": {
@@ -183,18 +190,23 @@ def workflow_spec() -> JsonDict:
 
 def build_install_onboarding_message() -> JsonDict:
     text = (
-        "为了完成首次安装，请先把下面这些信息准备好发给我：\n"
-        "1. 萤石摄像头信息：AppKey、AppSecret、AccessToken、设备序列号、设备验证码、通道号（默认 1）。\n"
-        "2. 火山云 LAS/TOS 信息：LAS_API_KEY、LAS_REGION、TOS_ACCESS_KEY、TOS_SECRET_KEY。\n"
-        "3. 商家自己的两个 TOS 目录：\n"
+        "为了完成首次安装，请先让 OpenClaw 默认安装下面 3 个 LAS skill：\n"
+        "1. npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-edit --agent openclaw\n"
+        "2. npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-resize --agent openclaw\n"
+        "3. npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-inpaint --agent openclaw\n"
+        "4. 然后再把下面这些信息准备好发给我：\n"
+        "   - 萤石摄像头信息：AppKey、AppSecret、AccessToken、设备序列号、设备验证码、通道号（默认 1）。\n"
+        "   - 火山云 LAS/TOS 信息：LAS_API_KEY、LAS_REGION、TOS_ACCESS_KEY、TOS_SECRET_KEY。\n"
+        "5. 商家自己的两个 TOS 目录：\n"
         "   - TOS_ORIGINAL，例如 tos://doudou-video/openclaw/store1_jsspa_original/\n"
         "   - TOS_FINAL，例如 tos://doudou-video/openclaw/store1_jsspa_final/\n"
-        "4. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
+        "6. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
         "后续插件会按这个时间段每日自动重复拍摄，直到你明确说“停止拍摄”。"
     )
     return {
         "send_after_install": True,
         "message_text": text,
+        "default_skill_install_commands": DEFAULT_LAS_SKILL_INSTALL_COMMANDS,
         "required_fields": [
             "EZVIZ_APP_KEY",
             "EZVIZ_APP_SECRET",

@@ -387,6 +387,8 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(spec["plugin_contract"]["mode"], "recurring_daily_capture")
         self.assertIn("每日", spec["plugin_contract"]["default_repeat_policy"])
         self.assertTrue(spec["installation_onboarding"]["send_message_after_install"])
+        self.assertEqual(len(spec["installation_onboarding"]["default_skill_install_commands"]), 3)
+        self.assertIn("byted-las-video-edit", spec["installation_onboarding"]["default_skill_install_commands"][0])
         self.assertEqual(spec["merchant_onboarding"]["first_question"], "你希望这个摄像头在什么时候拍？")
         self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["quality"], 1)
         self.assertIn("高光剪辑 -> 去水印 -> 变高清", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
@@ -396,6 +398,8 @@ class TaskManagerTests(unittest.TestCase):
     def test_install_onboarding_message_lists_required_fields(self):
         payload = build_install_onboarding_message()
         self.assertTrue(payload["send_after_install"])
+        self.assertEqual(len(payload["default_skill_install_commands"]), 3)
+        self.assertIn("byted-las-video-inpaint", payload["message_text"])
         self.assertIn("EZVIZ_APP_KEY", payload["required_fields"])
         self.assertIn("TOS_ORIGINAL", payload["required_fields"])
         self.assertIn("TOS_FINAL", payload["required_fields"])

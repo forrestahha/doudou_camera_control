@@ -130,6 +130,14 @@ The setup wizard actively asks for:
 
 Runtime OpenClaw agents must not hot-patch plugin source files. If capture fails because of a bug in `scripts/`, `skills/`, `tests/`, `README.md`, `SOUL.md`, or `openclaw.plugin.json`, stop, record the error, and tell the operator to update the plugin from GitHub. Only the maintainer should modify source in the development repository, run tests, and push a new version.
 
+After plugin install, OpenClaw should first install these 3 LAS skills by default before starting the full workflow:
+
+```bash
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-edit --agent openclaw
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-resize --agent openclaw
+npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-inpaint --agent openclaw
+```
+
 The setup wizard now always collects the full Volcano LAS/TOS configuration required by the complete plugin workflow:
 
 - `LAS_API_KEY`
