@@ -97,6 +97,19 @@ OpenClaw 接入时，应该把它理解成下面这 4 层：
 
 运行时 OpenClaw 不应该热修插件源码。商家现场环境只能修改环境变量、任务状态、OpenClaw 运行配置等非源码配置。如果发现 `scripts/`、`skills/`、`tests/`、`README.md`、`SOUL.md` 或 `openclaw.plugin.json` 的代码/文档问题，应记录错误并提示更新 GitHub 最新插件，而不是在 `/root/.openclaw/workspace/...` 里直接改文件。
 
+如果要走完整的 TOS/LAS 链路，请在运行环境镜像里预装 Python 包 `tos`。不要让 OpenClaw 在现场猜包名并临时 `pip install`。推荐先运行：
+
+```bash
+python3 scripts/ezviz_cb60_control.py doctor
+python3 scripts/ezviz_cb60_control.py tos-preflight
+```
+
+用它来区分：
+- `tos` SDK 没装
+- TOS 配置缺失
+- TOS endpoint DNS 解析失败
+- Bucket / 鉴权 / 网络访问失败
+
 ### 火山云 LAS/TOS 完整后处理必需项
 
 - `LAS_API_KEY`

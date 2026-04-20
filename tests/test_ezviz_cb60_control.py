@@ -313,6 +313,9 @@ class EzvizControlTests(unittest.TestCase):
         self.assertTrue(payload["required_full_workflow"]["LAS_API_KEY"])
         self.assertTrue(payload["required_full_workflow"]["TOS_ORIGINAL"])
         self.assertTrue(payload["required_full_workflow"]["TOS_FINAL"])
+        self.assertIn("runtime_dependencies", payload)
+        self.assertIn("tos_runtime", payload)
+        self.assertEqual(payload["runtime_dependencies"]["tos_sdk_package_name"], "tos")
 
     def test_doctor_flags_missing_full_workflow_config(self):
         config = EnvConfig(
@@ -326,6 +329,39 @@ class EzvizControlTests(unittest.TestCase):
         self.assertIn("TOS_ORIGINAL", payload["missing_full_workflow"])
         self.assertIn("TOS_FINAL", payload["missing_full_workflow"])
         self.assertNotIn("legacy_compat", payload)
+
+    def test_tos_preflight_reports_missing_configuration_first(self):
+        client = EzvizClient(EnvConfig(access_token="token", device_serial="serial"))
+        payload = client.tos_preflight()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["stage"], "config_missing")
+        self.assertIn("TOS_ACCESS_KEY", payload["missing_fields"])
+
+    def test_tos_preflight_reports_missing_sdk(self):
+        client = EzvizClient(
+            EnvConfig(
+                access_token="token",
+                device_serial="serial",
+                las_region="cn-beijing",
+                tos_access_key="tos-ak",
+                tos_secret_key="tos-sk",
+                tos_original="tos://demo-bucket/openclaw/original/",
+                tos_final="tos://demo-bucket/openclaw/final/",
+            )
+        )
+        import ezviz_cb60_control as module
+
+        old_probe = module.tos_sdk_installed
+        try:
+            module.tos_sdk_installed = lambda: False
+            payload = client.tos_preflight()
+        finally:
+            module.tos_sdk_installed = old_probe
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["stage"], "sdk_missing")
+        self.assertEqual(payload["sdk_package_name"], "tos")
+        self.assertIn("Preinstall package `tos`", payload["install_hint"])
 
     def test_ptz_pulse_issues_start_and_stop(self):
         requester = FakeRequester(

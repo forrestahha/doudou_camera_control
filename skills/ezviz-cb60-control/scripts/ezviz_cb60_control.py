@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import importlib.util
 import json
 import os
 import shlex
+import socket
 import sys
 import time
 import urllib.error
@@ -88,6 +90,32 @@ def flatten_battery_signals(payload: Any, prefix: str = "") -> Dict[str, Any]:
             next_prefix = f"{prefix}[{index}]"
             results.update(flatten_battery_signals(value, next_prefix))
     return results
+
+
+def tos_sdk_installed() -> bool:
+    return importlib.util.find_spec("tos") is not None
+
+
+def default_tos_endpoint(region: str) -> str:
+    resolved_region = region.strip() if isinstance(region, str) and region.strip() else "cn-beijing"
+    return f"tos-{resolved_region}.volces.com"
+
+
+def parse_tos_url(url: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "tos" or not parsed.netloc or not parsed.path:
+        raise EzvizError(f"Invalid TOS URL: {url}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def safe_tos_bucket(url: str) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        bucket, _ = parse_tos_url(url)
+        return bucket
+    except EzvizError:
+        return None
 
 
 def load_env_file(path: str) -> Dict[str, str]:
@@ -427,6 +455,15 @@ class EnvConfig:
                 "capture_wall_timeout_seconds": self.capture_wall_timeout_seconds,
                 "capture_with_las_wall_timeout_seconds": self.capture_with_las_wall_timeout_seconds,
             },
+            "runtime_dependencies": {
+                "tos_sdk_installed": tos_sdk_installed(),
+                "tos_sdk_package_name": "tos",
+            },
+            "tos_runtime": {
+                "endpoint": default_tos_endpoint(self.las_region),
+                "original_bucket": safe_tos_bucket(self.tos_original),
+                "final_bucket": safe_tos_bucket(self.tos_final),
+            },
         }
 
 
@@ -748,6 +785,85 @@ class EzvizClient:
             "device_serial": self.config.device_serial,
             "raw": data,
         }
+
+    def tos_preflight(
+        self,
+        resolver: Callable[..., Any] = socket.getaddrinfo,
+    ) -> JsonDict:
+        missing = []
+        if not self.config.tos_access_key:
+            missing.append("TOS_ACCESS_KEY")
+        if not self.config.tos_secret_key:
+            missing.append("TOS_SECRET_KEY")
+        if not self.config.tos_original:
+            missing.append("TOS_ORIGINAL")
+        if not self.config.tos_final:
+            missing.append("TOS_FINAL")
+
+        endpoint = default_tos_endpoint(self.config.las_region)
+        payload: JsonDict = {
+            "ok": False,
+            "endpoint": endpoint,
+            "sdk_package_name": "tos",
+            "sdk_installed": tos_sdk_installed(),
+            "missing_fields": missing,
+            "buckets": {
+                "original": safe_tos_bucket(self.config.tos_original),
+                "final": safe_tos_bucket(self.config.tos_final),
+            },
+        }
+
+        if missing:
+            payload["stage"] = "config_missing"
+            payload["reason"] = "Missing required TOS configuration."
+            return payload
+
+        if not payload["sdk_installed"]:
+            payload["stage"] = "sdk_missing"
+            payload["reason"] = "Missing Python package `tos` required for Volcano TOS uploads."
+            payload["install_hint"] = "Preinstall package `tos` in the runtime image/environment; do not guess package names at runtime."
+            return payload
+
+        try:
+            answers = resolver(endpoint, 443, type=socket.SOCK_STREAM)
+            addresses = sorted({item[4][0] for item in answers if item and len(item) >= 5 and item[4]})
+            payload["dns"] = {
+                "resolved": bool(addresses),
+                "addresses": addresses,
+            }
+        except Exception as exc:
+            payload["stage"] = "dns_failed"
+            payload["reason"] = f"Failed to resolve TOS endpoint: {exc}"
+            payload["dns"] = {
+                "resolved": False,
+                "addresses": [],
+            }
+            return payload
+
+        try:
+            import tos  # type: ignore
+
+            client = tos.TosClientV2(
+                ak=self.config.tos_access_key,
+                sk=self.config.tos_secret_key,
+                endpoint=endpoint,
+                region=self.config.las_region or "cn-beijing",
+            )
+            checked_buckets = []
+            for bucket in {payload["buckets"]["original"], payload["buckets"]["final"]}:
+                if not bucket:
+                    continue
+                client.head_bucket(bucket=bucket)
+                checked_buckets.append(bucket)
+            payload["ok"] = True
+            payload["stage"] = "ok"
+            payload["checked_buckets"] = checked_buckets
+            return payload
+        except Exception as exc:
+            payload["stage"] = "bucket_check_failed"
+            payload["reason"] = str(exc)
+            payload["network_hint"] = "If SDK is installed and credentials are correct, this usually points to TOS network reachability, DNS, or auth failure."
+            return payload
 
     def get_video_encode(self, stream_type: int = 1, channel_no: Optional[int] = None) -> JsonDict:
         effective_channel = self.config.channel_no if channel_no is None else channel_no
@@ -1113,6 +1229,8 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose_parser = subparsers.add_parser("diagnose-preview", help="Diagnose a preview URL or manual stream URL.")
     diagnose_parser.add_argument("--url", help="Preview URL to inspect. Falls back to EZVIZ_MANUAL_LIVE_URL.")
 
+    subparsers.add_parser("tos-preflight", help="Check whether the runtime can use Volcano TOS for uploads.")
+
     probe_parser = subparsers.add_parser("probe-channels", help="Probe whether the device exposes a second logical channel.")
     probe_parser.add_argument("--channels", nargs="+", type=int, default=[1, 2], help="Channel numbers to probe. Defaults to 1 2.")
     probe_parser.add_argument("--output-dir", type=Path, help="Optional directory for saving probe snapshots.")
@@ -1175,6 +1293,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     if args.command == "diagnose-preview":
         emit_json(client.diagnose_preview(url=args.url))
+        return 0
+    if args.command == "tos-preflight":
+        emit_json(client.tos_preflight())
         return 0
     if args.command == "device-info":
         emit_json(client.get_device_info())

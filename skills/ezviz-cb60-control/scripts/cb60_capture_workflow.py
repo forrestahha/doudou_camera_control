@@ -731,7 +731,7 @@ def build_tos_client(config: EnvConfig) -> Any:
     try:
         import tos  # type: ignore
     except ImportError as exc:
-        raise EzvizError("Missing tos SDK; unable to upload videos to TOS.") from exc
+        raise EzvizError("Missing Python package `tos`; unable to upload videos to Volcano TOS. Preinstall `tos` in the runtime environment instead of guessing package names at runtime.") from exc
 
     region = config.las_region or "cn-beijing"
     endpoint = f"tos-{region}.volces.com"

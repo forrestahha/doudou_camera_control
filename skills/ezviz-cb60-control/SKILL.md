@@ -139,6 +139,15 @@ The setup wizard now always collects the full Volcano LAS/TOS configuration requ
 - `TOS_ORIGINAL`
 - `TOS_FINAL`
 
+Before any full LAS/TOS run, the runtime should verify TOS readiness with:
+
+```bash
+python3 scripts/ezviz_cb60_control.py doctor
+python3 scripts/ezviz_cb60_control.py tos-preflight
+```
+
+Do not guess package names or install dependencies ad hoc during merchant-facing runs. The required Python package name is exactly `tos`, and it should be preinstalled in the runtime image/environment.
+
 If an operator wants to prepare a second camera profile on the same machine:
 
 ```bash
