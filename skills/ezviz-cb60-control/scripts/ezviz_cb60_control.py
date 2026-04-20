@@ -706,7 +706,7 @@ class EzvizClient:
             params["mute"] = mute
         if address_type is not None:
             params["type"] = address_type
-        live_source = first_nonempty(source, self.config.live_source)
+        live_source = first_nonempty(source, self.config.live_source, "1")
         if live_source:
             params["source"] = live_source
 

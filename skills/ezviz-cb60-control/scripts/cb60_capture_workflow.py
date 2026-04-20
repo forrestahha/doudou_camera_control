@@ -28,6 +28,7 @@ RotationMode = str
 DEFAULT_LIVE_PROTOCOL_ID = 4
 DEFAULT_LIVE_QUALITY = 1
 DEFAULT_LIVE_SUPPORT_H265 = 0
+DEFAULT_LIVE_SOURCE = "1"
 DEFAULT_LIVE_MUTE = 0
 DEFAULT_LIVE_ADDRESS_TYPE = 1
 DEFAULT_LOG_NAME = "capture-log.jsonl"
@@ -549,7 +550,7 @@ def resolve_stream_url(
             stream_id=config.managed_stream_id,
             protocol=config.managed_stream_protocol,
             quality=config.managed_stream_quality,
-            support_h265=config.managed_stream_support_h265,
+            support_h265=0,
             mute=config.managed_stream_mute,
         )
         stream_url = managed["address"]
@@ -559,7 +560,7 @@ def resolve_stream_url(
 
     effective_protocol_id = protocol_id if protocol_id is not None else DEFAULT_LIVE_PROTOCOL_ID
     live = client.get_live_url(
-        source=source,
+        source=source or DEFAULT_LIVE_SOURCE,
         protocol_id=effective_protocol_id,
         quality=DEFAULT_LIVE_QUALITY,
         support_h265=DEFAULT_LIVE_SUPPORT_H265,
@@ -958,7 +959,7 @@ def render_workflow_report(session: JsonDict, session_path: Path) -> Path:
         f"- Brief: {session.get('brief')}",
         f"- Created at: {session.get('created_at')}",
         f"- Storage root: {session.get('storage_root')}",
-        "- Default live chain: protocol=4, quality=1, supportH265=0, type=1",
+        "- Default live chain: protocol=4, quality=1, supportH265=0, source=1, type=1",
         f"- Accepted shots: {accepted_count}",
         f"- Abnormal shots: {abnormal_count}",
         f"- Failed shots: {failed_count}",

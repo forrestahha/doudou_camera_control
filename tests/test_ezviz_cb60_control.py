@@ -410,6 +410,8 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(payload["path"], "/api/lapp/live/address/get")
         self.assertEqual(payload["stream_url"], "https://stream.example/live.m3u8")
         self.assertEqual(len(requester.calls), 2)
+        _, params, _ = requester.calls[0]
+        self.assertEqual(params["source"], "1")
 
     def test_live_url_sends_source_when_provided(self):
         requester = FakeRequester(

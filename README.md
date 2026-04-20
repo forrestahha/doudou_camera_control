@@ -323,7 +323,7 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
 5. 原始文件保存在 `raw_output_path`
 6. 如果同时有 `FLV` 和 `HLS`，优先使用 `FLV`
 7. 如果设置了 `EZVIZ_MANAGED_STREAM_ID`，工作流会优先复用这条长期 `streamId` 获取最新地址，而不是默认依赖临时取流地址
-8. 如果既没有显式传 `--stream-url`，也没有配置长期 `streamId`，工作流会默认按 `protocol=4 + quality=1 + supportH265=0 + type=1` 现取最新 `FLV` 地址，优先请求 H264 兼容链路
+8. 如果既没有显式传 `--stream-url`，也没有配置长期 `streamId`，工作流会默认按 `protocol=4 + quality=1 + supportH265=0 + source=1 + type=1` 现取最新 `FLV` 地址，优先请求 H264 兼容链路
 9. 每次执行都会在 session 目录里写 `capture-log.jsonl` 和 `capture-report.md`
 10. 录后会自动验片；失败或异常时会自动截一帧，并补失败分析说明
 11. 验片通过后，会自动进入 LAS 后处理流水线，固定顺序为：
@@ -513,6 +513,7 @@ OpenClaw 在运行 `should-run-now` 时，现在要同时判断两件事：
 - `protocol=4`
 - `quality=1`
 - `supportH265=0`
+- `source=1`
 - `type=1`
 
 默认 LAS 规则固定为：

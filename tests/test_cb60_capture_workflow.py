@@ -92,8 +92,10 @@ class WorkflowTests(unittest.TestCase):
         class FakeClient:
             def __init__(self, config):
                 self.config = config
+                self.kwargs = None
 
             def get_stream_address(self, **kwargs):
+                self.kwargs = kwargs
                 return {"address": "https://demo/live.flv?sid=managed"}
 
         config = EnvConfig(
@@ -101,14 +103,16 @@ class WorkflowTests(unittest.TestCase):
             device_serial="d",
             managed_stream_id="stream-long-lived",
         )
+        fake_client = FakeClient(config)
         old_client = workflow.EzvizClient
         try:
-            workflow.EzvizClient = FakeClient
+            workflow.EzvizClient = lambda config: fake_client
             resolved = resolve_stream_url(config)
         finally:
             workflow.EzvizClient = old_client
 
         self.assertEqual(resolved, "https://demo/live.flv?sid=managed")
+        self.assertEqual(fake_client.kwargs["support_h265"], 0)
 
     def test_resolve_stream_url_defaults_to_flv_protocol_for_live_lookup(self):
         import cb60_capture_workflow as workflow
@@ -134,6 +138,7 @@ class WorkflowTests(unittest.TestCase):
             workflow.EzvizClient = old_client
 
         self.assertEqual(resolved, "https://demo/live.flv?sid=direct")
+        self.assertEqual(fake_client.kwargs["source"], "1")
         self.assertEqual(fake_client.kwargs["protocol_id"], 4)
         self.assertEqual(fake_client.kwargs["quality"], 1)
         self.assertEqual(fake_client.kwargs["support_h265"], 0)
