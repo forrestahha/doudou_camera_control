@@ -272,7 +272,7 @@ Run commands from:
 13. Use the generated shot order to reduce repositioning. The workflow intentionally groups shots by zone before capture.
 14. After each capture, read the next instruction from `capture-shot` or `next-shot` instead of asking for repeated confirmations.
 15. For OpenClaw-style runtime environments, the workflow should default to HLS first instead of FLV, because HLS has proven more stable than FLV `:9188` in those environments.
-16. If `EZVIZ_MANAGED_STREAM_ID` is set, the workflow should prefer that long-lived managed stream and fetch a fresh playback address from it instead of creating or assuming a temporary live address.
+16. If `EZVIZ_MANAGED_STREAM_ID` is set, the workflow should prefer that long-lived managed stream and fetch a fresh playback address from it instead of creating or assuming a temporary live address. Managed streams should also default to `HLS` first (`EZVIZ_MANAGED_STREAM_PROTOCOL=1`) unless the user explicitly overrides it.
 17. The workflow now tries to auto-convert recorded clips into rotated `.mp4` output when `ffmpeg` is available. The default is `cw90`, which turns a landscape source into portrait output.
 18. If conversion fails or `ffmpeg` is missing, it safely falls back to the original recorded container.
 19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=1`, `quality=1`, `supportH265=0`, and `type=1` so OpenClaw first tries the H264-compatible HLS address shape. The `source` parameter should use adaptive retry: retry with `source=1` only when the API says `source` is missing, and retry without `source` when the API says the field is invalid.

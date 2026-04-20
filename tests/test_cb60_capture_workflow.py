@@ -47,7 +47,7 @@ from cb60_capture_workflow import (  # noqa: E402
     session_summary,
     stream_url_path,
 )
-from ezviz_cb60_control import EnvConfig  # noqa: E402
+from ezviz_cb60_control import EnvConfig, EzvizError  # noqa: E402
 
 
 class WorkflowTests(unittest.TestCase):
@@ -115,7 +115,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(resolved, "https://demo/live.flv?sid=managed")
         self.assertEqual(fake_client.kwargs["support_h265"], 0)
 
-    def test_resolve_stream_url_defaults_to_flv_protocol_for_live_lookup(self):
+    def test_resolve_stream_url_defaults_to_hls_protocol_for_live_lookup(self):
         import cb60_capture_workflow as workflow
 
         class FakeClient:
@@ -140,11 +140,55 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertEqual(resolved, "https://demo/live.flv?sid=direct")
         self.assertIsNone(fake_client.kwargs["source"])
-        self.assertEqual(fake_client.kwargs["protocol_id"], 4)
+        self.assertEqual(fake_client.kwargs["protocol_id"], 1)
         self.assertEqual(fake_client.kwargs["quality"], 1)
         self.assertEqual(fake_client.kwargs["support_h265"], 0)
         self.assertEqual(fake_client.kwargs["mute"], 0)
         self.assertEqual(fake_client.kwargs["address_type"], 1)
+
+    def test_resolve_stream_url_falls_back_to_temporary_managed_stream_when_live_lookup_fails(self):
+        import cb60_capture_workflow as workflow
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+                self.create_kwargs = None
+                self.address_kwargs = None
+
+            def get_live_url(self, **kwargs):
+                raise EzvizError("Failed to get live stream URL.")
+
+            def create_stream(self, **kwargs):
+                self.create_kwargs = kwargs
+                return {"stream_id": "stream-123"}
+
+            def get_stream_address(self, **kwargs):
+                self.address_kwargs = kwargs
+                return {"address": "https://demo/live.m3u8?sid=managed"}
+
+        config = EnvConfig(access_token="t", device_serial="d")
+        fake_client = FakeClient(config)
+        old_client = workflow.EzvizClient
+        old_time = workflow.time.time
+        try:
+            workflow.EzvizClient = lambda config: fake_client
+            workflow.time.time = lambda: time.mktime(time.strptime("2026-04-20 10:00:00", "%Y-%m-%d %H:%M:%S"))
+            resolved = resolve_stream_url(config)
+        finally:
+            workflow.EzvizClient = old_client
+            workflow.time.time = old_time
+
+        self.assertEqual(resolved, "https://demo/live.m3u8?sid=managed")
+        self.assertEqual(
+            fake_client.create_kwargs,
+            {
+                "start_time": "2026-04-20 10:00:00",
+                "end_time": "2026-04-20 12:00:00",
+            },
+        )
+        self.assertEqual(fake_client.address_kwargs["stream_id"], "stream-123")
+        self.assertEqual(fake_client.address_kwargs["protocol"], 1)
+        self.assertEqual(fake_client.address_kwargs["support_h265"], 0)
 
     def test_plan_shots_caps_at_four_and_groups_by_zone(self):
         shots = plan_shots("商品近景, 门头, 制作过程, 收银台, 店内全景", max_shots=4)
@@ -489,6 +533,31 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("capture_timed_out", log_text)
             reloaded = load_session(session_path)
             self.assertEqual(reloaded["shots"][0]["status"], "pending")
+
+    def test_capture_next_shot_writes_log_and_report_when_stream_resolution_fails_early(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = init_session("门头", Path(tmp))
+            session_path = Path(session["storage_root"]) / "session.json"
+            import cb60_capture_workflow as workflow
+
+            old_resolve = workflow.resolve_stream_url
+            try:
+                workflow.resolve_stream_url = lambda *args, **kwargs: (_ for _ in ()).throw(
+                    EzvizError("Failed to get live stream URL.")
+                )
+                with self.assertRaisesRegex(EzvizError, "Failed to get live stream URL"):
+                    capture_next_shot(
+                        session_path=session_path,
+                        config=EnvConfig(access_token="t", device_serial="d"),
+                    )
+            finally:
+                workflow.resolve_stream_url = old_resolve
+
+            log_path = Path(session["storage_root"]) / "capture-log.jsonl"
+            report_path = Path(session["storage_root"]) / "capture-report.md"
+            self.assertTrue(log_path.exists())
+            self.assertTrue(report_path.exists())
+            self.assertIn("capture_resolve_stream_failed", log_path.read_text(encoding="utf-8"))
 
     def test_capture_next_shot_falls_back_when_mp4_conversion_is_unavailable(self):
         playlist = "\n".join(

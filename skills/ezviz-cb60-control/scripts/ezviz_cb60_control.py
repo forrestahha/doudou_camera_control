@@ -364,7 +364,7 @@ class EnvConfig:
     live_source: str = ""
     manual_live_url: str = ""
     managed_stream_id: str = ""
-    managed_stream_protocol: int = 3
+    managed_stream_protocol: int = 1
     managed_stream_quality: int = 1
     managed_stream_support_h265: int = 0
     managed_stream_mute: int = 0
@@ -425,7 +425,7 @@ class EnvConfig:
             live_source=env.get("EZVIZ_LIVE_SOURCE", "").strip(),
             manual_live_url=env.get("EZVIZ_MANUAL_LIVE_URL", "").strip(),
             managed_stream_id=env.get("EZVIZ_MANAGED_STREAM_ID", "").strip(),
-            managed_stream_protocol=parse_int_env("EZVIZ_MANAGED_STREAM_PROTOCOL", 3),
+            managed_stream_protocol=parse_int_env("EZVIZ_MANAGED_STREAM_PROTOCOL", 1),
             managed_stream_quality=parse_int_env("EZVIZ_MANAGED_STREAM_QUALITY", 1),
             managed_stream_support_h265=parse_int_env("EZVIZ_MANAGED_STREAM_SUPPORT_H265", 0),
             managed_stream_mute=parse_int_env("EZVIZ_MANAGED_STREAM_MUTE", 0),

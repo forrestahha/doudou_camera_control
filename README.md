@@ -460,6 +460,7 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
 5. 原始文件保存在 `raw_output_path`
 6. OpenClaw 默认优先使用 `HLS`
 7. 如果设置了 `EZVIZ_MANAGED_STREAM_ID`，工作流会优先复用这条长期 `streamId` 获取最新地址，而不是默认依赖临时取流地址
+   - 长期 `managed stream` 默认也优先使用 `HLS`（`EZVIZ_MANAGED_STREAM_PROTOCOL=1`）
 8. 如果既没有显式传 `--stream-url`，也没有配置长期 `streamId`，工作流会默认按 `protocol=1 + quality=1 + supportH265=0 + type=1` 现取最新 `HLS` 地址，优先避开部分 OpenClaw 环境下 `FLV :9188` 的连通性问题；`source` 会自适应重试：接口报“source为空”时补 `1`，接口报“source格式非法”时自动去掉
 9. 如果第一次录到的是低分辨率/异常短片/未通过验片，工作流会自动再尝试一次 `H265 + HLS` 主码流；只要第二次通过验片，就自动采用第二次结果，不需要 OpenClaw 现场改参数
 10. 拍摄执行入口固定是 `capture-shot`；OpenClaw 不要再用 `live-url`、`curl`、手写 `python -c` 或临时 API 探测来替代主流程

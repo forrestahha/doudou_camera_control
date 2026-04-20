@@ -30,6 +30,7 @@ DEFAULT_LIVE_QUALITY = 1
 DEFAULT_LIVE_SUPPORT_H265 = 0
 DEFAULT_LIVE_MUTE = 0
 DEFAULT_LIVE_ADDRESS_TYPE = 1
+DEFAULT_TEMP_STREAM_WINDOW_SECONDS = 7200
 ADAPTIVE_RETRY_PROTOCOL_ID = 1
 ADAPTIVE_RETRY_SUPPORT_H265 = 1
 DEFAULT_LOG_NAME = "capture-log.jsonl"
@@ -562,18 +563,45 @@ def resolve_stream_url(
         return stream_url
 
     effective_protocol_id = protocol_id if protocol_id is not None else DEFAULT_LIVE_PROTOCOL_ID
-    live = client.get_live_url(
-        source=source,
-        protocol_id=effective_protocol_id,
-        quality=DEFAULT_LIVE_QUALITY,
-        support_h265=DEFAULT_LIVE_SUPPORT_H265 if support_h265 is None else support_h265,
-        mute=DEFAULT_LIVE_MUTE,
-        address_type=DEFAULT_LIVE_ADDRESS_TYPE,
-    )
-    stream_url = live["stream_url"]
-    if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
-        raise EzvizError("The workflow recorder currently supports HLS (.m3u8) and FLV (.flv) stream URLs only.")
-    return stream_url
+    effective_support_h265 = DEFAULT_LIVE_SUPPORT_H265 if support_h265 is None else support_h265
+    try:
+        live = client.get_live_url(
+            source=source,
+            protocol_id=effective_protocol_id,
+            quality=DEFAULT_LIVE_QUALITY,
+            support_h265=effective_support_h265,
+            mute=DEFAULT_LIVE_MUTE,
+            address_type=DEFAULT_LIVE_ADDRESS_TYPE,
+        )
+        stream_url = live["stream_url"]
+        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
+            raise EzvizError("The workflow recorder currently supports HLS (.m3u8) and FLV (.flv) stream URLs only.")
+        return stream_url
+    except EzvizError as live_error:
+        now_ts = time.time()
+        start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts))
+        end_time = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(now_ts + DEFAULT_TEMP_STREAM_WINDOW_SECONDS),
+        )
+        stream = client.create_stream(start_time=start_time, end_time=end_time)
+        stream_id = stream.get("stream_id")
+        if not isinstance(stream_id, str) or not stream_id:
+            raise EzvizError(f"Failed to get live stream URL and temporary stream fallback did not return a streamId. Original error: {live_error}")
+        managed = client.get_stream_address(
+            stream_id=stream_id,
+            protocol=effective_protocol_id,
+            quality=DEFAULT_LIVE_QUALITY,
+            support_h265=effective_support_h265,
+            mute=DEFAULT_LIVE_MUTE,
+            address_type=DEFAULT_LIVE_ADDRESS_TYPE,
+        )
+        stream_url = managed["address"]
+        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
+            raise EzvizError(
+                "Failed to get live stream URL and temporary managed stream fallback returned an unsupported address."
+            )
+        return stream_url
 
 
 def build_raw_recording_path(output_path: Path, stream_url: str) -> Path:
@@ -1374,7 +1402,28 @@ def capture_next_shot(
             raise
 
     check_deadline("resolve stream")
-    effective_stream_url = stream_url or resolve_stream_url(config, source=source, protocol_id=protocol_id)
+    try:
+        effective_stream_url = stream_url or resolve_stream_url(config, source=source, protocol_id=protocol_id)
+    except Exception as exc:
+        log_path = log_func(
+            session,
+            session_path,
+            "capture_resolve_stream_failed",
+            {
+                "shot_index": shot["index"],
+                "shot_id": shot["shot_id"],
+                "reason": str(exc),
+                "default_live_chain": {
+                    "protocol": DEFAULT_LIVE_PROTOCOL_ID,
+                    "quality": DEFAULT_LIVE_QUALITY,
+                    "support_h265": DEFAULT_LIVE_SUPPORT_H265,
+                    "type": DEFAULT_LIVE_ADDRESS_TYPE,
+                },
+            },
+        )
+        save_session(session_path, session)
+        report_func(session, session_path)
+        raise
     check_deadline("start recording")
     capture_timestamp = build_capture_timestamp()
     log_path = log_func(

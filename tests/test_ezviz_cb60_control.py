@@ -141,6 +141,22 @@ class EzvizControlTests(unittest.TestCase):
             config = EnvConfig.from_env(env_file=str(env_path))
             self.assertEqual(config.las_inpaint_fixed_bboxes, ((0, 920, 340, 1000),))
 
+    def test_env_config_defaults_managed_stream_protocol_to_hls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "managed.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "export EZVIZ_ACCESS_TOKEN='token-4'",
+                        "export EZVIZ_DEVICE_SERIAL='device-4'",
+                        "export EZVIZ_MANAGED_STREAM_ID='stream-123'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = EnvConfig.from_env(env_file=str(env_path))
+            self.assertEqual(config.managed_stream_protocol, 1)
+
     def test_extract_env_file_arg_accepts_inline_and_positional_forms(self):
         cleaned, env_file = extract_env_file_arg(["capture-shot", "--env-file", "~/.ezviz_cb60_env_cam2", "--foo"])
         self.assertEqual(cleaned, ["capture-shot", "--foo"])
