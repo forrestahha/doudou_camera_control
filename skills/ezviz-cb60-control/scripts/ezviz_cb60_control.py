@@ -464,6 +464,7 @@ class EnvConfig:
                 "tos_sdk_installed": tos_sdk_installed(),
                 "tos_sdk_package_name": "tos",
                 "ffmpeg_installed": binary_available("ffmpeg"),
+                "ffmpeg_package_hint": "ffmpeg",
                 "tesseract_installed": binary_available("tesseract"),
                 "tesseract_package_hint": "tesseract-ocr",
             },

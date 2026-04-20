@@ -317,6 +317,7 @@ class EzvizControlTests(unittest.TestCase):
         self.assertIn("tos_runtime", payload)
         self.assertEqual(payload["runtime_dependencies"]["tos_sdk_package_name"], "tos")
         self.assertIn("ffmpeg_installed", payload["runtime_dependencies"])
+        self.assertEqual(payload["runtime_dependencies"]["ffmpeg_package_hint"], "ffmpeg")
         self.assertIn("tesseract_installed", payload["runtime_dependencies"])
         self.assertEqual(payload["runtime_dependencies"]["tesseract_package_hint"], "tesseract-ocr")
 
