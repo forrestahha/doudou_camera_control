@@ -324,15 +324,16 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
 6. 如果同时有 `FLV` 和 `HLS`，优先使用 `FLV`
 7. 如果设置了 `EZVIZ_MANAGED_STREAM_ID`，工作流会优先复用这条长期 `streamId` 获取最新地址，而不是默认依赖临时取流地址
 8. 如果既没有显式传 `--stream-url`，也没有配置长期 `streamId`，工作流会默认按 `protocol=4 + quality=1 + supportH265=0 + type=1` 现取最新 `FLV` 地址，优先请求 H264 兼容链路；`source` 会自适应重试：接口报“source为空”时补 `1`，接口报“source格式非法”时自动去掉
-9. 每次执行都会在 session 目录里写 `capture-log.jsonl` 和 `capture-report.md`
-10. 录后会自动验片；失败或异常时会自动截一帧，并补失败分析说明
-11. 验片通过后，会自动进入 LAS 后处理流水线，固定顺序为：
+9. 如果第一次录到的是低分辨率/异常短片/未通过验片，工作流会自动再尝试一次 `H265 + HLS` 主码流；只要第二次通过验片，就自动采用第二次结果，不需要 OpenClaw 现场改参数
+10. 每次执行都会在 session 目录里写 `capture-log.jsonl` 和 `capture-report.md`
+11. 录后会自动验片；失败或异常时会自动截一帧，并补失败分析说明
+12. 验片通过后，会自动进入 LAS 后处理流水线，固定顺序为：
     - 上传到火山 TOS
     - LAS 高光剪辑
     - LAS 去水印
     - LAS 变高清
-12. 单次执行有墙钟上限：默认普通拍摄最多 `180` 秒，含 LAS 全流程最多 `1800` 秒；超时会写入 `capture_timed_out` 日志并停止
-13. 本地文件和云上文件都会带拍摄时间戳
+13. 单次执行有墙钟上限：默认普通拍摄最多 `180` 秒，含 LAS 全流程最多 `1800` 秒；超时会写入 `capture_timed_out` 日志并停止
+14. 本地文件和云上文件都会带拍摄时间戳
 
 可通过环境变量调整上限：
 

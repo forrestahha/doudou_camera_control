@@ -150,6 +150,7 @@ def workflow_spec() -> JsonDict:
                 "quality": 1,
                 "supportH265": 0,
                 "source_strategy": "adaptive_retry",
+                "validation_retry_strategy": "retry_h265_hls_once_when_low_quality_or_abnormal",
                 "type": 1,
             },
             "workflow_defaults": [

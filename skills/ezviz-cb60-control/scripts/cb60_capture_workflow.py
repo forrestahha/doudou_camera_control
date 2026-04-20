@@ -30,6 +30,8 @@ DEFAULT_LIVE_QUALITY = 1
 DEFAULT_LIVE_SUPPORT_H265 = 0
 DEFAULT_LIVE_MUTE = 0
 DEFAULT_LIVE_ADDRESS_TYPE = 1
+ADAPTIVE_RETRY_PROTOCOL_ID = 1
+ADAPTIVE_RETRY_SUPPORT_H265 = 1
 DEFAULT_LOG_NAME = "capture-log.jsonl"
 DEFAULT_REPORT_NAME = "capture-report.md"
 LAS_PIPELINE_SKILL_ORDER: Tuple[Tuple[str, str], ...] = (
@@ -542,6 +544,7 @@ def resolve_stream_url(
     config: EnvConfig,
     source: Optional[str] = None,
     protocol_id: Optional[int] = None,
+    support_h265: Optional[int] = None,
 ) -> str:
     client = EzvizClient(config)
     if config.managed_stream_id:
@@ -549,7 +552,7 @@ def resolve_stream_url(
             stream_id=config.managed_stream_id,
             protocol=config.managed_stream_protocol,
             quality=config.managed_stream_quality,
-            support_h265=0,
+            support_h265=0 if support_h265 is None else support_h265,
             mute=config.managed_stream_mute,
         )
         stream_url = managed["address"]
@@ -562,7 +565,7 @@ def resolve_stream_url(
         source=source,
         protocol_id=effective_protocol_id,
         quality=DEFAULT_LIVE_QUALITY,
-        support_h265=DEFAULT_LIVE_SUPPORT_H265,
+        support_h265=DEFAULT_LIVE_SUPPORT_H265 if support_h265 is None else support_h265,
         mute=DEFAULT_LIVE_MUTE,
         address_type=DEFAULT_LIVE_ADDRESS_TYPE,
     )
@@ -675,6 +678,27 @@ def classify_capture_output(metrics: JsonDict, target_duration: int) -> str:
     if duration > 0.0:
         return "abnormal"
     return "failed"
+
+
+def should_retry_with_h265_hls(metrics: JsonDict, target_duration: int, validation_status: str) -> bool:
+    if validation_status == "accepted":
+        return False
+    if not metrics:
+        return True
+
+    duration = float(metrics.get("duration_seconds", 0.0) or 0.0)
+    width = int(metrics.get("width", 0) or 0)
+    height = int(metrics.get("height", 0) or 0)
+    short_edge = min(width, height) if width and height else 0
+    minimum_useful_duration = max(float(target_duration) - 4.0, float(target_duration) * 0.7)
+
+    if duration <= 0.0:
+        return True
+    if short_edge and short_edge < 720:
+        return True
+    if duration < minimum_useful_duration:
+        return True
+    return validation_status in {"abnormal", "failed"}
 
 
 def has_las_postprocess_config(config: EnvConfig) -> bool:
@@ -1438,6 +1462,100 @@ def capture_next_shot(
         )
         failure_analysis = analyze_failure_func(frame_path, metrics)
 
+    adaptive_retry_applied = False
+    if (
+        validation_status != "accepted"
+        and not stream_url
+        and protocol_id is None
+        and should_retry_with_h265_hls(metrics, int(shot["duration_seconds"]), validation_status)
+    ):
+        check_deadline("resolve adaptive h265 hls retry")
+        retry_stream_url = resolve_stream_url(
+            config,
+            source=source,
+            protocol_id=ADAPTIVE_RETRY_PROTOCOL_ID,
+            support_h265=ADAPTIVE_RETRY_SUPPORT_H265,
+        )
+        retry_capture_timestamp = build_capture_timestamp()
+        log_func(
+            session,
+            session_path,
+            "validation_failed_retry_h265_hls",
+            {
+                "shot_index": shot["index"],
+                "shot_id": shot["shot_id"],
+                "previous_validation_status": validation_status,
+                "previous_metrics": metrics,
+                "retry_stream_url": retry_stream_url,
+                "retry_protocol": ADAPTIVE_RETRY_PROTOCOL_ID,
+                "retry_support_h265": ADAPTIVE_RETRY_SUPPORT_H265,
+            },
+        )
+        retry_base_output_path = build_timestamped_shot_path(
+            session_path.parent / "shots",
+            int(shot["index"]),
+            str(shot["shot_id"]),
+            retry_capture_timestamp,
+            ".ts",
+        )
+        retry_raw_output_path = build_raw_recording_path(retry_base_output_path, retry_stream_url)
+        check_deadline("record adaptive h265 hls retry")
+        retry_result = record_stream_clip(
+            stream_url=retry_stream_url,
+            output_path=retry_raw_output_path,
+            target_duration=float(shot["duration_seconds"]),
+            timeout_seconds=config.timeout_seconds,
+            max_runtime_seconds=deadline.bounded_timeout(
+                max(float(shot["duration_seconds"]) + 20.0, 30.0),
+                "record adaptive h265 hls retry",
+            ),
+        )
+        check_deadline("transcode adaptive h265 hls retry")
+        retry_conversion = transcode_func(Path(retry_result["output_path"]), rotation_mode)
+        retry_final_output_path = retry_result["output_path"]
+        if retry_conversion.get("ok") and isinstance(retry_conversion.get("output_path"), str):
+            retry_final_output_path = retry_conversion["output_path"]
+        check_deadline("probe adaptive h265 hls retry")
+        retry_inspection_path = Path(retry_final_output_path)
+        retry_metrics = probe_func(retry_inspection_path) if retry_inspection_path.exists() else {}
+        retry_validation_status = classify_func(retry_metrics, int(shot["duration_seconds"]))
+        if retry_validation_status == "accepted":
+            adaptive_retry_applied = True
+            effective_stream_url = retry_stream_url
+            capture_timestamp = retry_capture_timestamp
+            result = retry_result
+            conversion = retry_conversion
+            final_output_path = retry_final_output_path
+            inspection_path = retry_inspection_path
+            metrics = retry_metrics
+            validation_status = retry_validation_status
+            frame_path = None
+            failure_analysis = ""
+            log_func(
+                session,
+                session_path,
+                "adaptive_h265_hls_retry_succeeded",
+                {
+                    "shot_index": shot["index"],
+                    "shot_id": shot["shot_id"],
+                    "metrics": retry_metrics,
+                    "final_output_path": retry_final_output_path,
+                },
+            )
+        else:
+            log_func(
+                session,
+                session_path,
+                "adaptive_h265_hls_retry_not_accepted",
+                {
+                    "shot_index": shot["index"],
+                    "shot_id": shot["shot_id"],
+                    "retry_validation_status": retry_validation_status,
+                    "retry_metrics": retry_metrics,
+                    "retry_output_path": retry_final_output_path,
+                },
+            )
+
     if las_enabled:
         session.setdefault("las_pipeline", {})["execution_mode"] = "inline_after_capture"
         session["las_pipeline"].setdefault("required_bridge", {})
@@ -1447,6 +1565,7 @@ def capture_next_shot(
     captured = mark_shot_captured(session, shot["index"], output_path=final_output_path)
     captured["capture_timestamp"] = capture_timestamp
     captured["raw_output_path"] = result["output_path"]
+    captured["adaptive_retry_applied"] = adaptive_retry_applied
     captured["validation"] = {
         "status": validation_status,
         "metrics": metrics,
@@ -1475,6 +1594,7 @@ def capture_next_shot(
             "recording": result,
             "conversion": conversion,
             "validation": captured["validation"],
+            "adaptive_retry_applied": adaptive_retry_applied,
             "postprocess": captured["postprocess"],
             "final_output_path": final_output_path,
             "elapsed_seconds": round(deadline.elapsed_seconds(), 3),

@@ -43,6 +43,7 @@ from cb60_capture_workflow import (  # noqa: E402
     record_flv_clip,
     record_hls_clip,
     resolve_stream_url,
+    should_retry_with_h265_hls,
     session_summary,
     stream_url_path,
 )
@@ -613,6 +614,93 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(reloaded["shots"][0]["postprocess"]["status"], "skipped_capture_not_accepted")
             self.assertEqual(payload["captured_shot"]["validation"]["status"], "abnormal")
 
+    def test_capture_next_shot_retries_h265_hls_when_initial_capture_is_low_quality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = init_session("门头", Path(tmp))
+            session_path = Path(session["storage_root"]) / "session.json"
+            import cb60_capture_workflow as workflow
+
+            old_resolve = workflow.resolve_stream_url
+            old_record = workflow.record_stream_clip
+            try:
+                resolve_calls = []
+                record_calls = []
+                probe_calls = []
+
+                def fake_resolve(config, source=None, protocol_id=None, support_h265=None):
+                    resolve_calls.append(
+                        {
+                            "source": source,
+                            "protocol_id": protocol_id,
+                            "support_h265": support_h265,
+                        }
+                    )
+                    if support_h265 == 1:
+                        return "https://demo/live-h265.m3u8"
+                    return "https://demo/live.flv"
+
+                def fake_record(stream_url: str, output_path: Path, *args, **kwargs):
+                    record_calls.append(stream_url)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(stream_url.encode("utf-8"))
+                    return {
+                        "output_path": str(output_path),
+                        "captured_duration_seconds": 15.0 if "h265" in stream_url else 6.0,
+                        "segment_count": 1,
+                        "source_protocol": "hls" if stream_url.endswith(".m3u8") else "flv",
+                    }
+
+                def fake_probe(path: Path):
+                    probe_calls.append(path.name)
+                    if "h265" in path.read_text(encoding="utf-8"):
+                        return {
+                            "duration_seconds": 16.0,
+                            "size_bytes": 4000,
+                            "width": 1440,
+                            "height": 2560,
+                            "video_codec": "h265",
+                            "audio_codec": "aac",
+                        }
+                    return {
+                        "duration_seconds": 6.0,
+                        "size_bytes": 500,
+                        "width": 288,
+                        "height": 512,
+                        "video_codec": "h264",
+                        "audio_codec": "",
+                    }
+
+                def fake_transcode(input_path: Path, rotation_mode: str):
+                    output_path = input_path.with_suffix(".mp4")
+                    output_path.write_text(input_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    return {"ok": True, "output_path": str(output_path), "layout": rotation_mode}
+
+                workflow.resolve_stream_url = fake_resolve
+                workflow.record_stream_clip = fake_record
+
+                payload = capture_next_shot(
+                    session_path=session_path,
+                    config=EnvConfig(access_token="t", device_serial="d"),
+                    transcode_func=fake_transcode,
+                    probe_func=fake_probe,
+                )
+            finally:
+                workflow.resolve_stream_url = old_resolve
+                workflow.record_stream_clip = old_record
+
+            reloaded = load_session(session_path)
+            self.assertEqual(record_calls, ["https://demo/live.flv", "https://demo/live-h265.m3u8"])
+            self.assertEqual(resolve_calls[0]["support_h265"], None)
+            self.assertEqual(resolve_calls[1]["protocol_id"], 1)
+            self.assertEqual(resolve_calls[1]["support_h265"], 1)
+            self.assertTrue(payload["captured_shot"]["adaptive_retry_applied"])
+            self.assertEqual(payload["captured_shot"]["validation"]["status"], "accepted")
+            self.assertEqual(reloaded["shots"][0]["validation"]["status"], "accepted")
+            self.assertTrue(reloaded["shots"][0]["adaptive_retry_applied"])
+            log_text = (Path(session["storage_root"]) / "capture-log.jsonl").read_text(encoding="utf-8")
+            self.assertIn("validation_failed_retry_h265_hls", log_text)
+            self.assertIn("adaptive_h265_hls_retry_succeeded", log_text)
+
     def test_build_las_postprocess_state_marks_pending_config_for_accepted_clip(self):
         session = init_session("门头", Path(tempfile.mkdtemp()))
         shot = session["shots"][0]
@@ -722,6 +810,22 @@ class WorkflowTests(unittest.TestCase):
             "abnormal",
         )
         self.assertEqual(classify_capture_output({}, 20), "failed")
+
+    def test_should_retry_with_h265_hls_for_low_quality_or_short_clip(self):
+        self.assertTrue(
+            should_retry_with_h265_hls(
+                {"duration_seconds": 6.0, "width": 288, "height": 512, "video_codec": "h264"},
+                20,
+                "abnormal",
+            )
+        )
+        self.assertFalse(
+            should_retry_with_h265_hls(
+                {"duration_seconds": 20.0, "width": 1080, "height": 1920, "video_codec": "h264"},
+                20,
+                "accepted",
+            )
+        )
 
 
 if __name__ == "__main__":
