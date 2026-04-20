@@ -706,26 +706,47 @@ class EzvizClient:
             params["mute"] = mute
         if address_type is not None:
             params["type"] = address_type
-        live_source = first_nonempty(source, self.config.live_source, "1")
-        if live_source:
-            params["source"] = live_source
-
         candidate_paths = [self.config.live_url_path] if self.config.live_url_path else list(self.LIVE_PATHS)
         errors = []
         for path in candidate_paths:
-            try:
-                payload = self._post_form(path, params)
-                data = self._extract_data(payload)
-                stream_url = find_first_url(data)
-                if not stream_url:
-                    raise EzvizError("No stream URL field was found in the response payload.")
-                return {
-                    "path": path,
-                    "stream_url": stream_url,
-                    "raw": data,
-                }
-            except EzvizError as exc:
-                errors.append(f"{path}: {exc}")
+            source_value = first_nonempty(source, self.config.live_source)
+            attempt_params = dict(params)
+            if source_value:
+                attempt_params["source"] = source_value
+            attempted_with_source = "source" in attempt_params
+            try_without_source_after_illegal = attempted_with_source
+            try_with_default_source_after_missing = not attempted_with_source
+
+            for retry_mode in ("primary", "without_source", "default_source"):
+                if retry_mode == "without_source":
+                    if not try_without_source_after_illegal:
+                        continue
+                    attempt_params = dict(params)
+                elif retry_mode == "default_source":
+                    if not try_with_default_source_after_missing:
+                        continue
+                    attempt_params = dict(params)
+                    attempt_params["source"] = "1"
+
+                try:
+                    payload = self._post_form(path, attempt_params)
+                    data = self._extract_data(payload)
+                    stream_url = find_first_url(data)
+                    if not stream_url:
+                        raise EzvizError("No stream URL field was found in the response payload.")
+                    return {
+                        "path": path,
+                        "stream_url": stream_url,
+                        "raw": data,
+                    }
+                except EzvizError as exc:
+                    error_text = str(exc)
+                    if retry_mode == "primary" and attempted_with_source and "source格式非法" in error_text:
+                        continue
+                    if retry_mode == "primary" and not attempted_with_source and "source为空" in error_text:
+                        continue
+                    errors.append(f"{path}: {exc}")
+                    break
         raise EzvizError("Failed to get live stream URL. " + " | ".join(errors))
 
     def diagnose_preview(self, url: Optional[str] = None) -> JsonDict:

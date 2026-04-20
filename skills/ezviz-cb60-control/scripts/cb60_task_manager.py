@@ -149,7 +149,7 @@ def workflow_spec() -> JsonDict:
                 "protocol": 4,
                 "quality": 1,
                 "supportH265": 0,
-                "source": 1,
+                "source_strategy": "adaptive_retry",
                 "type": 1,
             },
             "workflow_defaults": [

@@ -411,7 +411,7 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(payload["stream_url"], "https://stream.example/live.m3u8")
         self.assertEqual(len(requester.calls), 2)
         _, params, _ = requester.calls[0]
-        self.assertEqual(params["source"], "1")
+        self.assertNotIn("source", params)
 
     def test_live_url_sends_source_when_provided(self):
         requester = FakeRequester(
@@ -427,6 +427,44 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(payload["stream_url"], "https://stream.example/live.m3u8")
         _, params, _ = requester.calls[0]
         self.assertEqual(params["source"], "device")
+
+    def test_live_url_retries_with_default_source_when_api_requires_it(self):
+        requester = SequenceRequester(
+            [
+                EzvizError("10001: source为空"),
+                {
+                    "code": "200",
+                    "data": {"liveAddress": "https://stream.example/live.m3u8"},
+                },
+            ]
+        )
+        client = EzvizClient(self.make_config(), requester=requester)
+        payload = client.get_live_url()
+        self.assertEqual(payload["stream_url"], "https://stream.example/live.m3u8")
+        self.assertEqual(len(requester.calls), 2)
+        _, first_params, _, _ = requester.calls[0]
+        _, second_params, _, _ = requester.calls[1]
+        self.assertNotIn("source", first_params)
+        self.assertEqual(second_params["source"], "1")
+
+    def test_live_url_retries_without_source_when_api_rejects_it(self):
+        requester = SequenceRequester(
+            [
+                EzvizError("10001: source格式非法"),
+                {
+                    "code": "200",
+                    "data": {"liveAddress": "https://stream.example/live.m3u8"},
+                },
+            ]
+        )
+        client = EzvizClient(self.make_config(), requester=requester)
+        payload = client.get_live_url(source="1")
+        self.assertEqual(payload["stream_url"], "https://stream.example/live.m3u8")
+        self.assertEqual(len(requester.calls), 2)
+        _, first_params, _, _ = requester.calls[0]
+        _, second_params, _, _ = requester.calls[1]
+        self.assertEqual(first_params["source"], "1")
+        self.assertNotIn("source", second_params)
 
     def test_manual_live_url_short_circuits_api_lookup(self):
         config = self.make_config()

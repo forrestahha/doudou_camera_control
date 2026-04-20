@@ -138,7 +138,7 @@ class WorkflowTests(unittest.TestCase):
             workflow.EzvizClient = old_client
 
         self.assertEqual(resolved, "https://demo/live.flv?sid=direct")
-        self.assertEqual(fake_client.kwargs["source"], "1")
+        self.assertIsNone(fake_client.kwargs["source"])
         self.assertEqual(fake_client.kwargs["protocol_id"], 4)
         self.assertEqual(fake_client.kwargs["quality"], 1)
         self.assertEqual(fake_client.kwargs["support_h265"], 0)
