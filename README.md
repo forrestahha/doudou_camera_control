@@ -254,7 +254,8 @@ python3 scripts/ezviz_cb60_control.py doctor
 5. 再问：
    - `你希望这个摄像头在什么时候拍？`
 6. 用 `first-boot-setup` 创建每日重复任务
-7. 日常由 OpenClaw 周期执行：
+7. 立刻根据 `scheduler_spec` 给 OpenClaw 创建周期检查定时任务
+8. 日常由 OpenClaw 周期执行：
    - `battery-precheck`
    - `should-run-now`
    - `capture workflow`
@@ -547,6 +548,23 @@ python3 scripts/cb60_task_manager.py first-boot-setup \
 ```
 
 这个入口默认就会把商家提供的时间窗口写成“每日重复定时任务”。
+同时它还会返回一份 `scheduler_spec`，OpenClaw 必须立刻按这份配置创建周期检查任务；只写 `task.json` 不创建调度器，到时间不会自动拍摄。
+
+查看 OpenClaw 必须创建的周期任务配置：
+
+```bash
+python3 scripts/cb60_task_manager.py scheduler-spec \
+  --task ./artifacts/task-manager/store-a/task.json
+```
+
+在 OpenClaw 创建完周期任务后，建议回写一条确认记录：
+
+```bash
+python3 scripts/cb60_task_manager.py scheduler-installed \
+  --task ./artifacts/task-manager/store-a/task.json \
+  --automation-name doudou_camera_shot_check \
+  --delivery-channel main-session-channel
+```
 
 查看当前任务状态：
 
@@ -658,12 +676,14 @@ python3 scripts/cb60_task_manager.py daily-report \
 
 推荐把插件接成这条链：
 
-1. 后台先用 `init-task` 或 `set-schedule` 写入每日拍摄窗口
-2. OpenClaw 到时间后先调用 `should-run-now`
-3. 如果返回可执行，再调用 `cb60_capture_workflow.py`
-4. session 完成后调用 `record-session`
-5. 状态轮询单独常驻运行
-6. 日终或商家追问时，用 `daily-report` 和 `diagnose-task` 输出汇总
+1. 后台先用 `init-task` 或 `first-boot-setup` 写入每日拍摄窗口
+2. 立即读取 `scheduler-spec`，给 OpenClaw 创建每 10 分钟一次的周期检查任务
+3. 周期任务先调用 `battery-precheck`
+4. 再调用 `should-run-now`
+5. 如果返回可执行，再调用 `cb60_capture_workflow.py`
+6. session 完成后调用 `record-session`
+7. 状态轮询单独常驻运行
+8. 日终或商家追问时，用 `daily-report` 和 `diagnose-task` 输出汇总
 
 ## OpenClaw 调用时的判断规则
 

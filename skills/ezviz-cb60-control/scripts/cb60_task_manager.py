@@ -19,6 +19,46 @@ DEFAULT_BATTERY_REMINDER_THRESHOLD = 85
 DEFAULT_PRECHECK_LEAD_MINUTES = 60
 DEFAULT_CUSTOM_CAPTURE_INTERVAL_MINUTES = 10
 DEFAULT_CUSTOM_CLIP_DURATION_SECONDS = 20
+DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES = 10
+
+
+def build_scheduler_state() -> JsonDict:
+    return {
+        "required": True,
+        "check_every_minutes": DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES,
+        "automation_created": False,
+        "automation_name": None,
+        "delivery_channel": None,
+        "created_at": None,
+        "updated_at": None,
+        "source": None,
+    }
+
+
+def build_scheduler_spec(task: JsonDict, task_path: Optional[Path] = None) -> JsonDict:
+    resolved_task_path = Path(task["artifacts"]["config_path"]) if task_path is None else task_path
+    scheduler_state = task.get("scheduler") or build_scheduler_state()
+    automation_name = scheduler_state.get("automation_name") or f"doudou_camera_shot_check_{task['task_id']}"
+    return {
+        "required": True,
+        "automation_name": automation_name,
+        "mode": "periodic_poll",
+        "check_every_minutes": int(scheduler_state.get("check_every_minutes", DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES) or DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES),
+        "requires_delivery_channel": True,
+        "delivery_channel_note": "Set delivery.channel explicitly, or bind this automation to a main session with an existing channel.",
+        "task_path": str(resolved_task_path),
+        "execution_contract": {
+            "step_1": "run battery-precheck first",
+            "step_2": "run should-run-now",
+            "step_3": "only start capture workflow when should_run_now=true",
+            "step_4": "after session completes, call record-session",
+        },
+        "commands": {
+            "battery_precheck": f"python3 scripts/cb60_task_manager.py battery-precheck --task {resolved_task_path}",
+            "should_run_now": f"python3 scripts/cb60_task_manager.py should-run-now --task {resolved_task_path}",
+        },
+        "state": scheduler_state,
+    }
 
 
 def emit_json(payload: JsonDict) -> None:
@@ -43,7 +83,7 @@ def workflow_spec() -> JsonDict:
                 "11点到12点",
                 "上午11点到12点",
             ],
-            "first_boot_action": "收到时间段后，立即创建每日重复定时任务。",
+            "first_boot_action": "收到时间段后，立即创建每日重复定时任务，并立即给 OpenClaw 创建周期检查任务。",
         },
         "merchant_command_rules": {
             "wake_word": "龙虾",
@@ -85,6 +125,12 @@ def workflow_spec() -> JsonDict:
             "coexist_with_recurring_daily_schedule": True,
         },
         "scheduler_rules": {
+            "required_openclaw_automation": {
+                "must_create_after_first_boot_setup": True,
+                "check_every_minutes": DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES,
+                "delivery_channel_required": True,
+                "automation_purpose": "周期执行 battery-precheck 和 should-run-now，命中后再触发拍摄工作流。",
+            },
             "before_window": [
                 "在下一次拍摄开始前 60 分钟执行一次 battery-precheck。",
                 f"如果电量低于 {DEFAULT_BATTERY_REMINDER_THRESHOLD}% ，提醒商家充电。",
@@ -381,6 +427,7 @@ def init_task(
             "battery_threshold_percent": battery_reminder_threshold,
             "precheck_lead_minutes": precheck_lead_minutes,
         },
+        "scheduler": build_scheduler_state(),
         "artifacts": paths,
     }
     task_path = Path(paths["config_path"])
@@ -569,6 +616,40 @@ def set_schedule(
             "raw_command": raw_command,
             "start_time": schedule_start,
             "end_time": schedule_end,
+        },
+    )
+    return task
+
+
+def mark_scheduler_installed(
+    task_path: Path,
+    *,
+    automation_name: str,
+    delivery_channel: Optional[str] = None,
+    source: str = "openclaw",
+) -> JsonDict:
+    task = load_task(task_path)
+    task.setdefault("scheduler", build_scheduler_state())
+    task["scheduler"].update(
+        {
+            "required": True,
+            "check_every_minutes": int(task["scheduler"].get("check_every_minutes", DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES) or DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES),
+            "automation_created": True,
+            "automation_name": automation_name,
+            "delivery_channel": delivery_channel,
+            "created_at": task["scheduler"].get("created_at") or now_text(),
+            "updated_at": now_text(),
+            "source": source,
+        }
+    )
+    save_task(task_path, task)
+    append_task_event(
+        task,
+        "scheduler_installed",
+        {
+            "automation_name": automation_name,
+            "delivery_channel": delivery_channel,
+            "source": source,
         },
     )
     return task
@@ -941,6 +1022,16 @@ def diagnose_task(
     latest_session = next((row for row in reversed(events) if row.get("event") == "session_recorded"), None)
     issues: List[str] = []
     schedule_hint = build_schedule_hint(task, now_ts)
+    scheduler = task.get("scheduler") or build_scheduler_state()
+
+    if not scheduler.get("automation_created"):
+        issues.append(
+            "OpenClaw 还没有为这个任务创建周期检查定时器。首次配置后必须创建每 {minutes} 分钟执行一次的 should-run-now/battery-precheck 自动任务，否则到时间也不会自动拍摄。".format(
+                minutes=scheduler.get("check_every_minutes", DEFAULT_SCHEDULER_CHECK_INTERVAL_MINUTES)
+            )
+        )
+    elif not scheduler.get("delivery_channel"):
+        issues.append("OpenClaw 周期任务虽然已登记，但没有记录 delivery channel。若运行日志出现 “Channel is required”，请显式设置 delivery.channel。")
 
     if not task["status"]["active"]:
         issues.append(f"任务已停止，停止原因：{task['status'].get('stop_reason') or '未记录'}。")
@@ -987,6 +1078,7 @@ def diagnose_task(
         "task_active": task["status"]["active"],
         "schedule": task["schedule"],
         "schedule_hint": schedule_hint,
+        "scheduler": scheduler,
         "latest_session": latest_session,
         "device_snapshot": device_snapshot,
         "issues": issues,
@@ -1100,6 +1192,15 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("task-status", help="Show current task status and schedule.")
     status_parser.add_argument("--task", type=Path, required=True, help="Path to task.json.")
 
+    scheduler_spec_parser = subparsers.add_parser("scheduler-spec", help="输出 OpenClaw 必须创建的周期检查任务配置。")
+    scheduler_spec_parser.add_argument("--task", type=Path, required=True, help="Path to task.json.")
+
+    scheduler_installed_parser = subparsers.add_parser("scheduler-installed", help="记录 OpenClaw 已经创建好周期检查任务。")
+    scheduler_installed_parser.add_argument("--task", type=Path, required=True)
+    scheduler_installed_parser.add_argument("--automation-name", required=True)
+    scheduler_installed_parser.add_argument("--delivery-channel")
+    scheduler_installed_parser.add_argument("--source", default="openclaw")
+
     set_parser = subparsers.add_parser("set-schedule", help="Update the daily capture window.")
     set_parser.add_argument("--task", type=Path, required=True)
     set_parser.add_argument("--start-time", required=True)
@@ -1191,7 +1292,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "task_path": task["artifacts"]["config_path"],
                     "events_path": task["artifacts"]["events_path"],
                     "schedule": task["schedule"],
-                    "response": f"已记录商家拍摄时间 {task['schedule']['start_time']}-{task['schedule']['end_time']}，后续会按天自动执行。",
+                    "scheduler": task["scheduler"],
+                    "scheduler_spec": build_scheduler_spec(task),
+                    "response": (
+                        f"已记录商家拍摄时间 {task['schedule']['start_time']}-{task['schedule']['end_time']}。"
+                        "接下来必须立即给 OpenClaw 创建周期检查定时任务，否则到时间不会自动拍摄。"
+                    ),
                 }
             )
             return 0
@@ -1203,9 +1309,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "task_id": task["task_id"],
                     "task_name": task["task_name"],
                     "status": task["status"],
+                    "scheduler": task.get("scheduler", build_scheduler_state()),
                     "schedule": task["schedule"],
                     "custom_capture": task.get("custom_capture", {}),
                     **should_run_now(task),
+                }
+            )
+            return 0
+
+        if args.command == "scheduler-spec":
+            task = load_task(args.task)
+            emit_json(build_scheduler_spec(task, args.task))
+            return 0
+
+        if args.command == "scheduler-installed":
+            task = mark_scheduler_installed(
+                args.task,
+                automation_name=args.automation_name,
+                delivery_channel=args.delivery_channel,
+                source=args.source,
+            )
+            emit_json(
+                {
+                    "task_path": str(args.task),
+                    "scheduler": task["scheduler"],
                 }
             )
             return 0

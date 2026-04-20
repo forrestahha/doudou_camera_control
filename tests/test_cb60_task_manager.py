@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from cb60_task_manager import (  # noqa: E402
     battery_precheck,
     build_install_onboarding_message,
+    build_scheduler_spec,
     current_capture_mode,
     custom_capture_is_due,
     daily_report,
@@ -30,6 +31,7 @@ from cb60_task_manager import (  # noqa: E402
     next_capture_start_ts,
     parse_merchant_command,
     record_session_result,
+    mark_scheduler_installed,
     set_schedule,
     should_run_battery_precheck,
     should_run_now,
@@ -89,6 +91,39 @@ class TaskManagerTests(unittest.TestCase):
             )
             self.assertEqual(task["schedule"]["start_time"], "11:00")
             self.assertEqual(task["schedule"]["end_time"], "12:00")
+            self.assertTrue(task["scheduler"]["required"])
+            self.assertFalse(task["scheduler"]["automation_created"])
+
+    def test_build_scheduler_spec_freezes_openclaw_polling_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp),
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+            spec = build_scheduler_spec(task)
+            self.assertTrue(spec["required"])
+            self.assertEqual(spec["check_every_minutes"], 10)
+            self.assertTrue(spec["requires_delivery_channel"])
+            self.assertIn("should-run-now", spec["commands"]["should_run_now"])
+
+    def test_mark_scheduler_installed_persists_delivery_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp),
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+            task_path = Path(task["artifacts"]["config_path"])
+            updated = mark_scheduler_installed(
+                task_path,
+                automation_name="doudou_camera_shot_check",
+                delivery_channel="main-session-channel",
+            )
+            self.assertTrue(updated["scheduler"]["automation_created"])
+            self.assertEqual(updated["scheduler"]["delivery_channel"], "main-session-channel")
 
     def test_parse_merchant_command_supports_schedule_change_and_stop(self):
         parsed = parse_merchant_command("龙虾，帮我改一下拍摄时间 11:00-12:00")
@@ -271,8 +306,34 @@ class TaskManagerTests(unittest.TestCase):
                 client_factory=FakeClient,
             )
             joined = " ".join(diagnosis["issues"])
+            self.assertIn("周期检查定时器", joined)
             self.assertIn("10%", joined)
             self.assertIn("最近一次拍摄任务失败", joined)
+
+    def test_diagnose_task_reports_missing_delivery_channel_after_scheduler_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = init_task(
+                task_root=Path(tmp) / "task",
+                start_time="11:00",
+                end_time="12:00",
+                brief="门头",
+            )
+            task_path = Path(task["artifacts"]["config_path"])
+            mark_scheduler_installed(task_path, automation_name="doudou_camera_shot_check")
+
+            class FakeClient:
+                def __init__(self, config):
+                    self.config = config
+
+                def dump_device(self):
+                    return {
+                        "device_info": {"status": 1, "isEncrypt": 0},
+                        "battery": {"battery_percent": 88},
+                    }
+
+            diagnosis = diagnose_task(task_path, client_factory=FakeClient)
+            joined = " ".join(diagnosis["issues"])
+            self.assertIn("delivery channel", joined)
 
     def test_should_run_battery_precheck_checks_one_hour_before_window(self):
         with tempfile.TemporaryDirectory() as tmp:
