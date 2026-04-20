@@ -271,23 +271,24 @@ Run commands from:
 12. If the user wants a lightweight shoot flow, create a local session with `init-session` and keep the shot count at 3 or 4 maximum.
 13. Use the generated shot order to reduce repositioning. The workflow intentionally groups shots by zone before capture.
 14. After each capture, read the next instruction from `capture-shot` or `next-shot` instead of asking for repeated confirmations.
-15. The workflow now prefers FLV recording when a FLV address is provided, because it has proven more stable than the earlier HLS-only path in real-device validation.
+15. For OpenClaw-style runtime environments, the workflow should default to HLS first instead of FLV, because HLS has proven more stable than FLV `:9188` in those environments.
 16. If `EZVIZ_MANAGED_STREAM_ID` is set, the workflow should prefer that long-lived managed stream and fetch a fresh playback address from it instead of creating or assuming a temporary live address.
 17. The workflow now tries to auto-convert recorded clips into rotated `.mp4` output when `ffmpeg` is available. The default is `cw90`, which turns a landscape source into portrait output.
 18. If conversion fails or `ffmpeg` is missing, it safely falls back to the original recorded container.
-19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=4`, `quality=1`, `supportH265=0`, and `type=1` so it prefers the H264-compatible FLV address shape that is least likely to return the EZVIZ H265 placeholder frame. The `source` parameter should use adaptive retry: retry with `source=1` only when the API says `source` is missing, and retry without `source` when the API says the field is invalid.
+19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=1`, `quality=1`, `supportH265=0`, and `type=1` so OpenClaw first tries the H264-compatible HLS address shape. The `source` parameter should use adaptive retry: retry with `source=1` only when the API says `source` is missing, and retry without `source` when the API says the field is invalid.
 20. If the first automatic capture still produces a low-resolution clip, placeholder-like result, or otherwise fails validation, the workflow should automatically retry once with `H265 + HLS` main-stream settings and keep the retried result only when it passes validation. OpenClaw should not manually flip these knobs at runtime.
-20. Every workflow capture should append structured logs to `capture-log.jsonl` and refresh `capture-report.md` inside the session folder.
-21. After each capture, validate the resulting file. A clip should be accepted once duration reaches at least 10 seconds and resolution remains production-usable. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
-22. After an accepted capture, attach a deferred LAS post-process pipeline to the shot metadata. The fixed order is: `upload_to_tos -> las_highlight_edit -> las_video_inpaint -> las_video_resize`.
-23. Until the user provides the required TOS bridge access, keep that LAS pipeline in `pending_config` state. Do not invent TOS credentials or silently upload anything.
-24. Enforce wall-clock runtime limits for every `capture-shot`: default `CB60_CAPTURE_WALL_TIMEOUT_SECONDS=180` for capture-only runs and `CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS=5400` when LAS/TOS is configured. If the deadline is hit, stop, write `capture_timed_out`, and report the failure instead of debugging or retrying indefinitely.
-25. If a clip is abnormal or failed, mark the LAS pipeline as `skipped_capture_not_accepted` so later orchestration knows not to send bad media into LAS.
-26. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
-27. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
-28. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
-29. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
-30. For first-boot onboarding, prefer `first-boot-setup` so the merchant only needs to answer one thing: the capture time window.
+21. If a manually fetched or automatically fetched FLV URL fails with `502`, `Bad Gateway`, or a port-9188 connectivity error, do not immediately conclude that the server IP is banned. Let `capture-shot` own the retry/fallback path first. If manual intervention is still required, switch to `HLS` rather than stopping at the FLV diagnosis.
+22. Every workflow capture should append structured logs to `capture-log.jsonl` and refresh `capture-report.md` inside the session folder.
+23. After each capture, validate the resulting file. A clip should be accepted once duration reaches at least 10 seconds and resolution remains production-usable. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
+24. After an accepted capture, attach a deferred LAS post-process pipeline to the shot metadata. The fixed order is: `upload_to_tos -> las_highlight_edit -> las_video_inpaint -> las_video_resize`.
+25. Until the user provides the required TOS bridge access, keep that LAS pipeline in `pending_config` state. Do not invent TOS credentials or silently upload anything.
+26. Enforce wall-clock runtime limits for every `capture-shot`: default `CB60_CAPTURE_WALL_TIMEOUT_SECONDS=180` for capture-only runs and `CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS=5400` when LAS/TOS is configured. If the deadline is hit, stop, write `capture_timed_out`, and report the failure instead of debugging or retrying indefinitely.
+27. If a clip is abnormal or failed, mark the LAS pipeline as `skipped_capture_not_accepted` so later orchestration knows not to send bad media into LAS.
+28. Keep all captured clips local for now under the session folder. Do not add cloud upload unless the user asks.
+29. If the user requests recurring device health polling, use `cb60_status_monitor.py`; default to 60-second intervals unless the user asks for something else.
+30. The status monitor should write `samples.jsonl`, `samples.csv`, `events.jsonl`, and `report.md` under its output directory.
+31. If the user wants OpenClaw to run a daily capture window, use `cb60_task_manager.py init-task` to create a local task state file instead of inventing a new scheduler format.
+32. For first-boot onboarding, prefer `first-boot-setup` so the merchant only needs to answer one thing: the capture time window.
 31. After `first-boot-setup`, OpenClaw must immediately read `scheduler-spec` and create the recurring checker automation. Writing `task.json` alone is not enough to make captures happen.
 32. The recurring checker must run every 10 minutes, call `battery-precheck` first, then `should-run-now`, and only trigger capture when `should_run_now=true`.
 33. If OpenClaw creates that recurring checker successfully, it should call `scheduler-installed` and persist the automation name plus delivery channel into the task file.

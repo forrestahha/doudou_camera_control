@@ -164,7 +164,7 @@ def workflow_spec() -> JsonDict:
         },
         "capture_command_rules": {
             "default_live_chain": {
-                "protocol": 4,
+                "protocol": 1,
                 "quality": 1,
                 "supportH265": 0,
                 "source_strategy": "adaptive_retry",

@@ -404,6 +404,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(len(spec["installation_onboarding"]["default_skill_install_commands"]), 3)
         self.assertIn("byted-las-video-edit", spec["installation_onboarding"]["default_skill_install_commands"][0])
         self.assertEqual(spec["merchant_onboarding"]["first_question"], "你希望这个摄像头在什么时候拍？")
+        self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["protocol"], 1)
         self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["quality"], 1)
         self.assertIn("高光剪辑 -> 去水印 -> 变高清", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
         self.assertEqual(spec["custom_capture_rules"]["default_clip_duration_seconds"], 20)
