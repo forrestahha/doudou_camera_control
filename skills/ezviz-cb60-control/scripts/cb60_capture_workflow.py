@@ -33,6 +33,7 @@ DEFAULT_LIVE_ADDRESS_TYPE = 1
 DEFAULT_TEMP_STREAM_WINDOW_SECONDS = 7200
 ADAPTIVE_RETRY_PROTOCOL_ID = 1
 ADAPTIVE_RETRY_SUPPORT_H265 = 1
+VIDEO_CODE_H265 = {5, "5", "H265", "h265"}
 DEFAULT_LOG_NAME = "capture-log.jsonl"
 DEFAULT_REPORT_NAME = "capture-report.md"
 LAS_PIPELINE_SKILL_ORDER: Tuple[Tuple[str, str], ...] = (
@@ -604,6 +605,37 @@ def resolve_stream_url(
         return stream_url
 
 
+def ensure_primary_stream_h264(config: EnvConfig) -> JsonDict:
+    client = EzvizClient(config)
+    payload = {
+        "checked": False,
+        "changed": False,
+        "target": "H264",
+        "status": "skipped",
+        "reason": "",
+        "video_code": None,
+    }
+    try:
+        encode_info = client.get_video_encode(stream_type=1)
+        video_code = encode_info.get("video_code")
+        payload["checked"] = True
+        payload["video_code"] = video_code
+        if video_code not in VIDEO_CODE_H265:
+            payload["status"] = "already_h264_or_unknown"
+            payload["reason"] = "Primary stream is not explicitly reported as H265; no encode switch needed."
+            return payload
+        switch_result = client.set_video_encode("H264")
+        payload["changed"] = True
+        payload["status"] = "switched"
+        payload["reason"] = "Primary stream reported H265 and was switched to H264."
+        payload["switch_result"] = switch_result
+        return payload
+    except EzvizError as exc:
+        payload["status"] = "failed"
+        payload["reason"] = str(exc)
+        return payload
+
+
 def build_raw_recording_path(output_path: Path, stream_url: str) -> Path:
     if stream_url_path(stream_url).endswith(".flv"):
         return output_path.with_suffix(".flv")
@@ -1011,7 +1043,8 @@ def render_workflow_report(session: JsonDict, session_path: Path) -> Path:
         f"- Brief: {session.get('brief')}",
         f"- Created at: {session.get('created_at')}",
         f"- Storage root: {session.get('storage_root')}",
-        "- Default live chain: protocol=1, quality=1, supportH265=0, type=1; source uses adaptive retry (empty -> 1, illegal -> omitted)",
+        "- Default direct live chain: protocol=1, quality=1, supportH265=0, type=1; source uses adaptive retry (empty -> 1, illegal -> omitted)",
+        "- Default managed stream chain: protocol=1, quality=1, supportH265=1, type=1; if recording succeeds, the final local deliverable is still transcoded to H264 MP4.",
         f"- Accepted shots: {accepted_count}",
         f"- Abnormal shots: {abnormal_count}",
         f"- Failed shots: {failed_count}",
@@ -1400,6 +1433,18 @@ def capture_next_shot(
             )
             save_session(session_path, session)
             raise
+
+    encode_preflight = ensure_primary_stream_h264(config)
+    log_func(
+        session,
+        session_path,
+        "video_encode_preflight",
+        {
+            "shot_index": shot["index"],
+            "shot_id": shot["shot_id"],
+            "result": encode_preflight,
+        },
+    )
 
     check_deadline("resolve stream")
     try:

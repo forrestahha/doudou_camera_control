@@ -33,6 +33,7 @@ from cb60_capture_workflow import (  # noqa: E402
     build_las_postprocess_state,
     classify_capture_output,
     capture_next_shot,
+    ensure_primary_stream_h264,
     extract_failure_frame,
     init_session,
     load_session,
@@ -189,6 +190,61 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(fake_client.address_kwargs["stream_id"], "stream-123")
         self.assertEqual(fake_client.address_kwargs["protocol"], 1)
         self.assertEqual(fake_client.address_kwargs["support_h265"], 0)
+
+    def test_ensure_primary_stream_h264_switches_when_device_reports_h265(self):
+        import cb60_capture_workflow as workflow
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+                self.switched = False
+
+            def get_video_encode(self, stream_type=1):
+                return {"video_code": 5}
+
+            def set_video_encode(self, encode_type, channel_no=None):
+                self.switched = True
+                return {"encode_type": encode_type}
+
+        config = EnvConfig(access_token="t", device_serial="d")
+        fake_client = FakeClient(config)
+        old_client = workflow.EzvizClient
+        try:
+            workflow.EzvizClient = lambda config: fake_client
+            result = ensure_primary_stream_h264(config)
+        finally:
+            workflow.EzvizClient = old_client
+
+        self.assertTrue(result["checked"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["status"], "switched")
+        self.assertTrue(fake_client.switched)
+
+    def test_ensure_primary_stream_h264_tolerates_unsupported_switch(self):
+        import cb60_capture_workflow as workflow
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = config
+
+            def get_video_encode(self, stream_type=1):
+                return {"video_code": 5}
+
+            def set_video_encode(self, encode_type, channel_no=None):
+                raise EzvizError("60020: 不支持该命令")
+
+        config = EnvConfig(access_token="t", device_serial="d")
+        old_client = workflow.EzvizClient
+        try:
+            workflow.EzvizClient = lambda config: FakeClient(config)
+            result = ensure_primary_stream_h264(config)
+        finally:
+            workflow.EzvizClient = old_client
+
+        self.assertTrue(result["checked"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("60020", result["reason"])
 
     def test_plan_shots_caps_at_four_and_groups_by_zone(self):
         shots = plan_shots("商品近景, 门头, 制作过程, 收银台, 店内全景", max_shots=4)

@@ -156,6 +156,7 @@ class EzvizControlTests(unittest.TestCase):
             )
             config = EnvConfig.from_env(env_file=str(env_path))
             self.assertEqual(config.managed_stream_protocol, 1)
+            self.assertEqual(config.managed_stream_support_h265, 1)
 
     def test_extract_env_file_arg_accepts_inline_and_positional_forms(self):
         cleaned, env_file = extract_env_file_arg(["capture-shot", "--env-file", "~/.ezviz_cb60_env_cam2", "--foo"])
