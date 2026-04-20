@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import socket
 import sys
 import time
@@ -94,6 +95,10 @@ def flatten_battery_signals(payload: Any, prefix: str = "") -> Dict[str, Any]:
 
 def tos_sdk_installed() -> bool:
     return importlib.util.find_spec("tos") is not None
+
+
+def binary_available(name: str) -> bool:
+    return shutil.which(name) is not None
 
 
 def default_tos_endpoint(region: str) -> str:
@@ -458,6 +463,9 @@ class EnvConfig:
             "runtime_dependencies": {
                 "tos_sdk_installed": tos_sdk_installed(),
                 "tos_sdk_package_name": "tos",
+                "ffmpeg_installed": binary_available("ffmpeg"),
+                "tesseract_installed": binary_available("tesseract"),
+                "tesseract_package_hint": "tesseract-ocr",
             },
             "tos_runtime": {
                 "endpoint": default_tos_endpoint(self.las_region),

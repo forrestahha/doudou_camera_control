@@ -316,6 +316,9 @@ class EzvizControlTests(unittest.TestCase):
         self.assertIn("runtime_dependencies", payload)
         self.assertIn("tos_runtime", payload)
         self.assertEqual(payload["runtime_dependencies"]["tos_sdk_package_name"], "tos")
+        self.assertIn("ffmpeg_installed", payload["runtime_dependencies"])
+        self.assertIn("tesseract_installed", payload["runtime_dependencies"])
+        self.assertEqual(payload["runtime_dependencies"]["tesseract_package_hint"], "tesseract-ocr")
 
     def test_doctor_flags_missing_full_workflow_config(self):
         config = EnvConfig(

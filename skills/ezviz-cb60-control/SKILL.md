@@ -148,6 +148,13 @@ python3 scripts/ezviz_cb60_control.py tos-preflight
 
 Do not guess package names or install dependencies ad hoc during merchant-facing runs. The required Python package name is exactly `tos`, and it should be preinstalled in the runtime image/environment.
 
+The runtime should also preinstall:
+
+- `ffmpeg`
+- `tesseract-ocr`
+
+`tesseract` is only used for OCR on saved failure frames. It is not a prerequisite for an `accepted` capture.
+
 If an operator wants to prepare a second camera profile on the same machine:
 
 ```bash
@@ -255,7 +262,7 @@ Run commands from:
 19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=4`, `quality=1`, `supportH265=0`, and `type=1` so it prefers the H264-compatible FLV address shape that is least likely to return the EZVIZ H265 placeholder frame. The `source` parameter should use adaptive retry: retry with `source=1` only when the API says `source` is missing, and retry without `source` when the API says the field is invalid.
 20. If the first automatic capture still produces a low-resolution clip, placeholder-like result, or otherwise fails validation, the workflow should automatically retry once with `H265 + HLS` main-stream settings and keep the retried result only when it passes validation. OpenClaw should not manually flip these knobs at runtime.
 20. Every workflow capture should append structured logs to `capture-log.jsonl` and refresh `capture-report.md` inside the session folder.
-21. After each capture, validate the resulting file. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
+21. After each capture, validate the resulting file. A clip should be accepted once duration reaches at least 10 seconds and resolution remains production-usable. If validation is abnormal or failed, save a failure frame and attach a short failure analysis. If `tesseract` is available locally, include OCR text from the saved frame.
 22. After an accepted capture, attach a deferred LAS post-process pipeline to the shot metadata. The fixed order is: `upload_to_tos -> las_highlight_edit -> las_video_inpaint -> las_video_resize`.
 23. Until the user provides the required TOS bridge access, keep that LAS pipeline in `pending_config` state. Do not invent TOS credentials or silently upload anything.
 24. Enforce wall-clock runtime limits for every `capture-shot`: default `CB60_CAPTURE_WALL_TIMEOUT_SECONDS=180` for capture-only runs and `CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS=1800` when LAS/TOS is configured. If the deadline is hit, stop, write `capture_timed_out`, and report the failure instead of debugging or retrying indefinitely.

@@ -671,7 +671,7 @@ def classify_capture_output(metrics: JsonDict, target_duration: int) -> str:
     duration = float(metrics.get("duration_seconds", 0.0) or 0.0)
     width = int(metrics.get("width", 0) or 0)
     height = int(metrics.get("height", 0) or 0)
-    min_duration = max(float(target_duration) - 2.0, float(target_duration) * 0.8)
+    min_duration = min(max(float(target_duration) - 2.0, float(target_duration) * 0.8), 10.0)
 
     if duration >= min_duration and width >= 1000 and height >= 1000:
         return "accepted"

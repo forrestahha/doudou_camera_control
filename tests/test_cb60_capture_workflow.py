@@ -810,6 +810,13 @@ class WorkflowTests(unittest.TestCase):
             "abnormal",
         )
         self.assertEqual(classify_capture_output({}, 20), "failed")
+        self.assertEqual(
+            classify_capture_output(
+                {"duration_seconds": 10.1, "width": 1080, "height": 1920, "video_codec": "h264"},
+                15,
+            ),
+            "accepted",
+        )
 
     def test_should_retry_with_h265_hls_for_low_quality_or_short_clip(self):
         self.assertTrue(

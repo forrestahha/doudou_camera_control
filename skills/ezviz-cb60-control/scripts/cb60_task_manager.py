@@ -75,6 +75,11 @@ def workflow_spec() -> JsonDict:
         "installation_onboarding": {
             "send_message_after_install": True,
             "next_step_after_requirements": "收齐安装信息后，再向商家追问“你希望这个摄像头在什么时候拍？”。",
+            "runtime_prerequisites": [
+                "运行环境需要预装 ffmpeg。",
+                "运行环境需要预装 tesseract-ocr，供异常帧 OCR 分析使用。",
+                "完整云上链路还需要预装 Python 包 tos。",
+            ],
         },
         "merchant_onboarding": {
             "first_question": "你希望这个摄像头在什么时候拍？",
@@ -156,6 +161,8 @@ def workflow_spec() -> JsonDict:
             "workflow_defaults": [
                 "录后自动转竖屏 MP4。",
                 "录后自动验片。",
+                "验片主规则以时长和分辨率为准；达到 10 秒且分辨率达标即可 accepted。",
+                "tesseract 只用于异常帧 OCR 分析，不是 accepted 的前置条件。",
                 "失败或异常时自动截帧并补图像分析。",
                 "验片通过后自动进入 LAS 顺序：高光剪辑 -> 去水印 -> 变高清。",
             ],
