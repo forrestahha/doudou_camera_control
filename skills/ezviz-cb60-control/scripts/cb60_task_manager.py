@@ -148,7 +148,7 @@ def workflow_spec() -> JsonDict:
             "default_live_chain": {
                 "protocol": 4,
                 "quality": 1,
-                "supportH265": 1,
+                "supportH265": 0,
                 "type": 1,
             },
             "workflow_defaults": [

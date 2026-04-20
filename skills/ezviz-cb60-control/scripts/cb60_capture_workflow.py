@@ -27,7 +27,7 @@ JsonDict = Dict[str, Any]
 RotationMode = str
 DEFAULT_LIVE_PROTOCOL_ID = 4
 DEFAULT_LIVE_QUALITY = 1
-DEFAULT_LIVE_SUPPORT_H265 = 1
+DEFAULT_LIVE_SUPPORT_H265 = 0
 DEFAULT_LIVE_MUTE = 0
 DEFAULT_LIVE_ADDRESS_TYPE = 1
 DEFAULT_LOG_NAME = "capture-log.jsonl"
@@ -958,7 +958,7 @@ def render_workflow_report(session: JsonDict, session_path: Path) -> Path:
         f"- Brief: {session.get('brief')}",
         f"- Created at: {session.get('created_at')}",
         f"- Storage root: {session.get('storage_root')}",
-        "- Default live chain: protocol=4, quality=1, supportH265=1, type=1",
+        "- Default live chain: protocol=4, quality=1, supportH265=0, type=1",
         f"- Accepted shots: {accepted_count}",
         f"- Abnormal shots: {abnormal_count}",
         f"- Failed shots: {failed_count}",

@@ -136,7 +136,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(resolved, "https://demo/live.flv?sid=direct")
         self.assertEqual(fake_client.kwargs["protocol_id"], 4)
         self.assertEqual(fake_client.kwargs["quality"], 1)
-        self.assertEqual(fake_client.kwargs["support_h265"], 1)
+        self.assertEqual(fake_client.kwargs["support_h265"], 0)
         self.assertEqual(fake_client.kwargs["mute"], 0)
         self.assertEqual(fake_client.kwargs["address_type"], 1)
 

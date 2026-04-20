@@ -335,7 +335,7 @@ class EnvConfig:
     managed_stream_id: str = ""
     managed_stream_protocol: int = 3
     managed_stream_quality: int = 1
-    managed_stream_support_h265: int = 1
+    managed_stream_support_h265: int = 0
     managed_stream_mute: int = 0
     timeout_seconds: float = 20.0
     las_api_key: str = ""
@@ -396,7 +396,7 @@ class EnvConfig:
             managed_stream_id=env.get("EZVIZ_MANAGED_STREAM_ID", "").strip(),
             managed_stream_protocol=parse_int_env("EZVIZ_MANAGED_STREAM_PROTOCOL", 3),
             managed_stream_quality=parse_int_env("EZVIZ_MANAGED_STREAM_QUALITY", 1),
-            managed_stream_support_h265=parse_int_env("EZVIZ_MANAGED_STREAM_SUPPORT_H265", 1),
+            managed_stream_support_h265=parse_int_env("EZVIZ_MANAGED_STREAM_SUPPORT_H265", 0),
             managed_stream_mute=parse_int_env("EZVIZ_MANAGED_STREAM_MUTE", 0),
             timeout_seconds=float(env.get("EZVIZ_TIMEOUT_SECONDS", "20").strip() or "20"),
             las_api_key=env.get("LAS_API_KEY", "").strip(),
