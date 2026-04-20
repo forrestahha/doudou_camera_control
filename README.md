@@ -715,7 +715,7 @@ OpenClaw 在运行 `should-run-now` 时，现在要同时判断两件事：
 
 默认取流规则固定为：
 
-- `protocol=4`
+- `protocol=1`
 - `quality=1`
 - `supportH265=0`
 - `source` 自适应重试：先按现有配置请求，必要时补 `1` 或自动去掉
