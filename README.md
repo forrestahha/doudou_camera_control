@@ -240,9 +240,19 @@ source ~/.ezviz_cb60_env
 python3 scripts/ezviz_cb60_control.py doctor
 ```
 
+注意：
+
+- `TOS_ORIGINAL` 和 `TOS_FINAL` 现在是强制项，不能再只配 `TOS_PREFIX`
+- 两个目录必须显式指向商家目录，例如：
+  - `tos://doudou-video/openclaw/store1_jsspa_original/`
+  - `tos://doudou-video/openclaw/store1_jsspa_final/`
+- 插件会拒绝通用目录，例如：
+  - `tos://doudou-video/openclaw/original/`
+  - `tos://doudou-video/openclaw/final/`
+
 ## 商家 TOS 目录规则与云上命名
 
-商家云上目录不是随便填的，插件默认按这套规则工作：
+商家云上目录不是随便填的，插件强制按这套规则工作：
 
 - 每个商家在 `openclaw/` 下有两个目录
 - 一个放原始视频

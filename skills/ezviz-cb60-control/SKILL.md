@@ -146,6 +146,8 @@ The setup wizard now always collects the full Volcano LAS/TOS configuration requ
 - `TOS_SECRET_KEY`
 - `TOS_ORIGINAL`
 - `TOS_FINAL`
+- `TOS_ORIGINAL` 和 `TOS_FINAL` 必须是显式商家目录，不能只给 `TOS_PREFIX`
+- 禁止使用通用目录，如 `tos://.../openclaw/original/` 或 `tos://.../openclaw/final/`
 
 Before any full LAS/TOS run, the runtime should verify TOS readiness with:
 

@@ -123,6 +123,26 @@ def safe_tos_bucket(url: str) -> Optional[str]:
         return None
 
 
+def validate_tos_stage_prefix(env_name: str, value: str) -> str:
+    resolved = value.strip()
+    if not resolved:
+        return ""
+    bucket, key = parse_tos_url(resolved)
+    if not bucket or not key:
+        raise EzvizError(f"{env_name} 必须是有效的 tos:// 前缀。")
+    normalized = resolved if resolved.endswith("/") else resolved + "/"
+    parsed = urllib.parse.urlparse(normalized)
+    last_segment = parsed.path.rstrip("/").split("/")[-1]
+    expected_suffix = "_original" if env_name == "TOS_ORIGINAL" else "_final"
+    disallowed_segments = {"original", "final"}
+    if last_segment in disallowed_segments or not last_segment.endswith(expected_suffix):
+        raise EzvizError(
+            f"{env_name} 必须显式指向商家目录，并以 {expected_suffix} 结尾，"
+            f"例如 tos://doudou-video/openclaw/store1_jsspa{expected_suffix}/。"
+        )
+    return normalized
+
+
 def load_env_file(path: str) -> Dict[str, str]:
     env_path = Path(path).expanduser()
     if not env_path.exists():
@@ -268,8 +288,14 @@ def run_setup_wizard(
     las_region = prompt_func("LAS_REGION (例如 cn-beijing): ").strip()
     tos_access_key = secret_prompt_func("TOS_ACCESS_KEY: ").strip()
     tos_secret_key = secret_prompt_func("TOS_SECRET_KEY: ").strip()
-    tos_original = prompt_func("TOS_ORIGINAL (例如 tos://doudou-video/openclaw/store1_jsspa_original/): ").strip()
-    tos_final = prompt_func("TOS_FINAL (例如 tos://doudou-video/openclaw/store1_jsspa_final/): ").strip()
+    tos_original = validate_tos_stage_prefix(
+        "TOS_ORIGINAL",
+        prompt_func("TOS_ORIGINAL (例如 tos://doudou-video/openclaw/store1_jsspa_original/): ").strip(),
+    )
+    tos_final = validate_tos_stage_prefix(
+        "TOS_FINAL",
+        prompt_func("TOS_FINAL (例如 tos://doudou-video/openclaw/store1_jsspa_final/): ").strip(),
+    )
 
     las_required = {
         "LAS_API_KEY": las_api_key,
@@ -411,8 +437,8 @@ class EnvConfig:
             las_inpaint_fixed_bboxes=parse_fixed_bboxes(env.get("LAS_INPAINT_FIXED_BBOXES", "")),
             tos_bucket=env.get("TOS_BUCKET", "").strip(),
             tos_prefix=env.get("TOS_PREFIX", "").strip(),
-            tos_original=env.get("TOS_ORIGINAL", "").strip() or env.get("TOS_PREFIX", "").strip(),
-            tos_final=env.get("TOS_FINAL", "").strip(),
+            tos_original=validate_tos_stage_prefix("TOS_ORIGINAL", env.get("TOS_ORIGINAL", "").strip()),
+            tos_final=validate_tos_stage_prefix("TOS_FINAL", env.get("TOS_FINAL", "").strip()),
             env_file_path=resolved_env_file,
             capture_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WALL_TIMEOUT_SECONDS", 180.0),
             capture_with_las_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS", 5400.0),

@@ -26,6 +26,7 @@ from ezviz_cb60_control import (  # noqa: E402
     join_url,
     normalize_stream_address_protocol,
     run_setup_wizard,
+    validate_tos_stage_prefix,
     update_env_file_value,
     write_env_file,
 )
@@ -165,16 +166,16 @@ class EzvizControlTests(unittest.TestCase):
                     "LAS_REGION": "cn-beijing",
                     "TOS_ACCESS_KEY": "tos-ak",
                     "TOS_SECRET_KEY": "tos-sk",
-                    "TOS_ORIGINAL": "tos://demo-bucket/openclaw/original/",
-                    "TOS_FINAL": "tos://demo-bucket/openclaw/final/",
+                    "TOS_ORIGINAL": "tos://demo-bucket/openclaw/store1_demo_original/",
+                    "TOS_FINAL": "tos://demo-bucket/openclaw/store1_demo_final/",
                 },
             )
             text = path.read_text(encoding="utf-8")
             self.assertIn("export EZVIZ_APP_KEY='key'", text)
             self.assertIn("export EZVIZ_DEVICE_SERIAL='serial'", text)
             self.assertIn("export LAS_API_KEY='las-key'", text)
-            self.assertIn("export TOS_ORIGINAL='tos://demo-bucket/openclaw/original/'", text)
-            self.assertIn("export TOS_FINAL='tos://demo-bucket/openclaw/final/'", text)
+            self.assertIn("export TOS_ORIGINAL='tos://demo-bucket/openclaw/store1_demo_original/'", text)
+            self.assertIn("export TOS_FINAL='tos://demo-bucket/openclaw/store1_demo_final/'", text)
 
     def test_update_env_file_value_preserves_other_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,8 +239,8 @@ class EzvizControlTests(unittest.TestCase):
                 "device-10",
                 "1",
                 "cn-beijing",
-                "tos://demo-bucket/openclaw/original/",
-                "tos://demo-bucket/openclaw/final/",
+                "tos://demo-bucket/openclaw/store1_demo_original/",
+                "tos://demo-bucket/openclaw/store1_demo_final/",
             ]
         )
         secret_answers = iter(
@@ -266,8 +267,8 @@ class EzvizControlTests(unittest.TestCase):
             loaded = EnvConfig.from_env(env_file=str(env_path))
             self.assertEqual(loaded.las_api_key, "las-key-10")
             self.assertEqual(loaded.las_region, "cn-beijing")
-            self.assertEqual(loaded.tos_original, "tos://demo-bucket/openclaw/original/")
-            self.assertEqual(loaded.tos_final, "tos://demo-bucket/openclaw/final/")
+            self.assertEqual(loaded.tos_original, "tos://demo-bucket/openclaw/store1_demo_original/")
+            self.assertEqual(loaded.tos_final, "tos://demo-bucket/openclaw/store1_demo_final/")
 
     def test_normalize_stream_address_protocol_accepts_legacy_flv_alias(self):
         self.assertEqual(normalize_stream_address_protocol(1), 1)
@@ -323,8 +324,8 @@ class EzvizControlTests(unittest.TestCase):
             las_region="cn-beijing",
             tos_access_key="tos-ak",
             tos_secret_key="tos-sk",
-            tos_original="tos://demo-bucket/openclaw/original/",
-            tos_final="tos://demo-bucket/openclaw/final/",
+            tos_original="tos://demo-bucket/openclaw/store1_demo_original/",
+            tos_final="tos://demo-bucket/openclaw/store1_demo_final/",
         )
         payload = config.doctor()
         self.assertTrue(payload["capture_ready"])
@@ -368,8 +369,8 @@ class EzvizControlTests(unittest.TestCase):
                 las_region="cn-beijing",
                 tos_access_key="tos-ak",
                 tos_secret_key="tos-sk",
-                tos_original="tos://demo-bucket/openclaw/original/",
-                tos_final="tos://demo-bucket/openclaw/final/",
+                tos_original="tos://demo-bucket/openclaw/store1_demo_original/",
+                tos_final="tos://demo-bucket/openclaw/store1_demo_final/",
             )
         )
         import ezviz_cb60_control as module
@@ -385,6 +386,32 @@ class EzvizControlTests(unittest.TestCase):
         self.assertEqual(payload["stage"], "sdk_missing")
         self.assertEqual(payload["sdk_package_name"], "tos")
         self.assertIn("Preinstall package `tos`", payload["install_hint"])
+
+    def test_validate_tos_stage_prefix_rejects_generic_original_and_final_dirs(self):
+        with self.assertRaises(EzvizError):
+            validate_tos_stage_prefix("TOS_ORIGINAL", "tos://demo-bucket/openclaw/original/")
+        with self.assertRaises(EzvizError):
+            validate_tos_stage_prefix("TOS_FINAL", "tos://demo-bucket/openclaw/final/")
+
+    def test_env_config_does_not_fallback_to_tos_prefix_for_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "tos-prefix-only.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "EZVIZ_ACCESS_TOKEN='token'",
+                        "EZVIZ_DEVICE_SERIAL='serial'",
+                        "TOS_PREFIX='tos://demo-bucket/openclaw/store1_demo_original/'",
+                        "TOS_FINAL='tos://demo-bucket/openclaw/store1_demo_final/'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = EnvConfig.from_env(env_file=str(env_path))
+
+        self.assertEqual(config.tos_original, "")
+        self.assertEqual(config.tos_final, "tos://demo-bucket/openclaw/store1_demo_final/")
 
     def test_ptz_pulse_issues_start_and_stop(self):
         requester = FakeRequester(
