@@ -86,6 +86,12 @@ def workflow_spec() -> JsonDict:
                 "运行环境需要预装 tesseract-ocr，供异常帧 OCR 分析使用。",
                 "完整云上链路还需要预装 Python 包 tos。",
                 "首次安装插件后，默认先安装 3 个 LAS skill：高光剪辑、去水印、变高清。",
+                "OpenClaw 处理 LAS 时必须直接调用已安装的本地 LAS skills，不得自行重写认证、域名或签名逻辑。",
+            ],
+            "las_runtime_contract": [
+                "LAS 高光剪辑、去水印、变高清必须通过本地已安装的 byted-las-video-* skills 调用。",
+                "不得自行改写为 AK/SK 签名认证、替换 LAS 域名，或猜测其他密钥用途。",
+                "当前正确方式是由本地 skill 使用 Bearer LAS_API_KEY 调 operator.las.<region>.volces.com。",
             ],
         },
         "merchant_onboarding": {
@@ -165,13 +171,14 @@ def workflow_spec() -> JsonDict:
                 "validation_retry_strategy": "retry_h265_hls_once_when_low_quality_or_abnormal",
                 "type": 1,
             },
-            "workflow_defaults": [
+        "workflow_defaults": [
                 "录后自动转竖屏 MP4。",
                 "录后自动验片。",
                 "验片主规则以时长和分辨率为准；达到 10 秒且分辨率达标即可 accepted。",
                 "tesseract 只用于异常帧 OCR 分析，不是 accepted 的前置条件。",
                 "失败或异常时自动截帧并补图像分析。",
                 "验片通过后自动进入 LAS 顺序：高光剪辑 -> 去水印 -> 变高清。",
+                "LAS 步骤必须复用本地已安装 skill，不允许 OpenClaw 自己实现 LAS 认证与请求签名。",
             ],
         },
         "recommended_openclaw_sequence": [
@@ -200,7 +207,8 @@ def build_install_onboarding_message() -> JsonDict:
         "5. 商家自己的两个 TOS 目录：\n"
         "   - TOS_ORIGINAL，例如 tos://doudou-video/openclaw/store1_jsspa_original/\n"
         "   - TOS_FINAL，例如 tos://doudou-video/openclaw/store1_jsspa_final/\n"
-        "6. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
+        "6. LAS 流程必须直接调用已安装的本地 byted-las-video-* skills；不要在 OpenClaw 运行时自行改写 LAS 认证、域名或签名逻辑。\n"
+        "7. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
         "后续插件会按这个时间段每日自动重复拍摄，直到你明确说“停止拍摄”。"
     )
     return {

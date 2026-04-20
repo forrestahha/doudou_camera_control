@@ -558,6 +558,19 @@ export LAS_INPAINT_FIXED_BBOXES='[[0,650,150,970]]'
 #### 变高清
 - 默认输出 **2K 规格竖屏视频**
 
+#### LAS 调用硬规则
+- OpenClaw 必须直接调用已安装的本地 LAS skills：
+  - `byted-las-video-edit`
+  - `byted-las-video-inpaint`
+  - `byted-las-video-resize`
+- 不要在 OpenClaw 运行时自己重写 LAS 认证、切换成 AK/SK 签名、替换域名，或猜测 `TOS_SECRET_KEY` 等其他密钥含义
+- 当前插件与本地 LAS skills 的正确调用方式是：由 skill 自身向 `operator.las.<region>.volces.com` 发请求，并使用 `Authorization: Bearer ${LAS_API_KEY}`
+- 如果 LAS 失败，优先检查：
+  - skill 是否已安装
+  - `LAS_API_KEY` / `LAS_REGION` 是否在运行环境中
+  - session 下的 `las-results/*.json`
+- 不要让 OpenClaw 在商家运行环境里临时改写 LAS 网络/认证实现
+
 ### 本地与云上产物
 
 每次拍摄后通常会有这些文件：

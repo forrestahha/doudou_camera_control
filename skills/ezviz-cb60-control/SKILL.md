@@ -138,6 +138,12 @@ npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-vide
 npx skills add https://skills.volces.com/skills/volcengine/las -s byted-las-video-inpaint --agent openclaw
 ```
 
+LAS hard rule:
+
+- OpenClaw must call the installed local LAS skills directly for highlight edit, inpaint, and resize
+- OpenClaw must not rewrite LAS authentication, switch domains, invent AK/SK signing, decode unrelated secrets, or replace the built-in Bearer `LAS_API_KEY` flow
+- If LAS fails, inspect the installed skill output and plugin logs first; do not patch LAS transport/auth logic during merchant-facing runs
+
 The setup wizard now always collects the full Volcano LAS/TOS configuration required by the complete plugin workflow:
 
 - `LAS_API_KEY`

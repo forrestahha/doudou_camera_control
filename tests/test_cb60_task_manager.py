@@ -108,6 +108,20 @@ class TaskManagerTests(unittest.TestCase):
             self.assertTrue(spec["requires_delivery_channel"])
             self.assertIn("should-run-now", spec["commands"]["should_run_now"])
 
+    def test_workflow_spec_and_onboarding_freeze_las_runtime_contract(self):
+        spec = workflow_spec()
+        self.assertIn(
+            "OpenClaw 处理 LAS 时必须直接调用已安装的本地 LAS skills，不得自行重写认证、域名或签名逻辑。",
+            spec["installation_onboarding"]["runtime_prerequisites"],
+        )
+        self.assertIn(
+            "当前正确方式是由本地 skill 使用 Bearer LAS_API_KEY 调 operator.las.<region>.volces.com。",
+            spec["installation_onboarding"]["las_runtime_contract"],
+        )
+
+        onboarding = build_install_onboarding_message()
+        self.assertIn("不要在 OpenClaw 运行时自行改写 LAS 认证、域名或签名逻辑", onboarding["message_text"])
+
     def test_mark_scheduler_installed_persists_delivery_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = init_task(
