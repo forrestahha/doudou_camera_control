@@ -115,12 +115,25 @@ class TaskManagerTests(unittest.TestCase):
             spec["installation_onboarding"]["runtime_prerequisites"],
         )
         self.assertIn(
+            "OpenClaw 处理拍摄任务时必须以 capture-shot 为唯一录制入口，不得用 live-url、手写 python -c、curl 或其他临时脚本绕开主流程。",
+            spec["installation_onboarding"]["runtime_prerequisites"],
+        )
+        self.assertIn(
             "当前正确方式是由本地 skill 使用 Bearer LAS_API_KEY 调 operator.las.<region>.volces.com。",
             spec["installation_onboarding"]["las_runtime_contract"],
+        )
+        self.assertIn(
+            "拍摄任务必须直接调用 cb60_capture_workflow.py capture-shot。",
+            spec["installation_onboarding"]["capture_runtime_contract"],
+        )
+        self.assertIn(
+            "OpenClaw 不要用 live-url、curl、手写 python -c 或临时 curl 诊断来替代 capture-shot。",
+            spec["capture_command_rules"]["runtime_contract"],
         )
 
         onboarding = build_install_onboarding_message()
         self.assertIn("不要在 OpenClaw 运行时自行改写 LAS 认证、域名或签名逻辑", onboarding["message_text"])
+        self.assertIn("拍摄执行入口固定为 capture-shot", onboarding["message_text"])
 
     def test_mark_scheduler_installed_persists_delivery_channel(self):
         with tempfile.TemporaryDirectory() as tmp:

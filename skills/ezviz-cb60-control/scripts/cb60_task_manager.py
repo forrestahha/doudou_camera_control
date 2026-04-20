@@ -87,11 +87,17 @@ def workflow_spec() -> JsonDict:
                 "完整云上链路还需要预装 Python 包 tos。",
                 "首次安装插件后，默认先安装 3 个 LAS skill：高光剪辑、去水印、变高清。",
                 "OpenClaw 处理 LAS 时必须直接调用已安装的本地 LAS skills，不得自行重写认证、域名或签名逻辑。",
+                "OpenClaw 处理拍摄任务时必须以 capture-shot 为唯一录制入口，不得用 live-url、手写 python -c、curl 或其他临时脚本绕开主流程。",
             ],
             "las_runtime_contract": [
                 "LAS 高光剪辑、去水印、变高清必须通过本地已安装的 byted-las-video-* skills 调用。",
                 "不得自行改写为 AK/SK 签名认证、替换 LAS 域名，或猜测其他密钥用途。",
                 "当前正确方式是由本地 skill 使用 Bearer LAS_API_KEY 调 operator.las.<region>.volces.com。",
+            ],
+            "capture_runtime_contract": [
+                "拍摄任务必须直接调用 cb60_capture_workflow.py capture-shot。",
+                "不允许在拍摄失败时改用 live-url、手写 python -c、curl 或临时 API 调试脚本来替代 capture-shot。",
+                "允许读取 capture-log.jsonl、capture-report.md、session.json 做诊断，但不要自己手工推导流地址或下结论。",
             ],
         },
         "merchant_onboarding": {
@@ -171,7 +177,12 @@ def workflow_spec() -> JsonDict:
                 "validation_retry_strategy": "retry_h265_hls_once_when_low_quality_or_abnormal",
                 "type": 1,
             },
-        "workflow_defaults": [
+            "runtime_contract": [
+                "拍摄执行入口固定为 python3 scripts/cb60_capture_workflow.py capture-shot --session <session.json>。",
+                "OpenClaw 不要用 live-url、curl、手写 python -c 或临时 curl 诊断来替代 capture-shot。",
+                "如果 capture-shot 失败，只读取 capture-log.jsonl 和 capture-report.md，再按失败原因汇报；不要自行推断 IP 被封、CDN 故障或安全组问题。",
+            ],
+            "workflow_defaults": [
                 "录后自动转竖屏 MP4。",
                 "录后自动验片。",
                 "验片主规则以时长和分辨率为准；达到 10 秒且分辨率达标即可 accepted。",
@@ -188,7 +199,7 @@ def workflow_spec() -> JsonDict:
             "调用 first-boot-setup 创建 task.json。",
             "每天定时前 1 小时运行 battery-precheck。",
             "到达时间窗口时运行 should-run-now。",
-            "如果 should_run_now=true，则执行拍摄工作流。",
+            "如果 should_run_now=true，则直接执行 capture-shot 驱动的拍摄工作流，不要额外手写 live-url、curl 或 python -c 调试。",
             "拍完后调用 record-session。",
             "按天调用 daily-report 生成设备运行日报。",
         ],
@@ -208,7 +219,8 @@ def build_install_onboarding_message() -> JsonDict:
         "   - TOS_ORIGINAL，例如 tos://doudou-video/openclaw/store1_jsspa_original/\n"
         "   - TOS_FINAL，例如 tos://doudou-video/openclaw/store1_jsspa_final/\n"
         "6. LAS 流程必须直接调用已安装的本地 byted-las-video-* skills；不要在 OpenClaw 运行时自行改写 LAS 认证、域名或签名逻辑。\n"
-        "7. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
+        "7. 拍摄执行入口固定为 capture-shot；不要在 OpenClaw 运行时用 live-url、curl、手写 python -c 或临时脚本绕开主流程。\n"
+        "8. 以上信息配置完成后，我会继续问你：你希望这个摄像头在什么时候拍？\n"
         "后续插件会按这个时间段每日自动重复拍摄，直到你明确说“停止拍摄”。"
     )
     return {
