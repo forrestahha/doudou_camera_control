@@ -419,6 +419,8 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(spec["merchant_onboarding"]["first_question"], "你希望这个摄像头在什么时候拍？")
         self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["protocol"], 1)
         self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["quality"], 1)
+        self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["supportH265"], 1)
+        self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["stream_resolution_strategy"], "managed_stream_address_only")
         self.assertIn("高光剪辑 -> 去水印 -> 变高清", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
         self.assertEqual(spec["custom_capture_rules"]["default_clip_duration_seconds"], 20)
         self.assertTrue(spec["custom_capture_rules"]["coexist_with_recurring_daily_schedule"])

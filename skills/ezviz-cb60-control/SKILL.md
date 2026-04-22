@@ -227,13 +227,13 @@ python3 scripts/ezviz_cb60_control.py ptz right --duration 1.2
 python3 scripts/ezviz_cb60_control.py snapshot --output /tmp/cb60.jpg
 python3 scripts/ezviz_cb60_control.py video-encode-get --stream-type 1
 python3 scripts/ezviz_cb60_control.py stream-create --start-time '2026-03-25 19:15:55' --end-time '2026-03-25 21:15:55'
-python3 scripts/ezviz_cb60_control.py stream-address --stream-id <stream_id> --protocol 3 --quality 1 --support-h265 1
+python3 scripts/ezviz_cb60_control.py stream-address --stream-id <stream_id> --protocol 1 --quality 1 --support-h265 1
 python3 scripts/ezviz_cb60_control.py live-url --source <tenant-source>
 python3 scripts/ezviz_cb60_control.py diagnose-preview --url '<preview-url>'
 python3 scripts/ezviz_cb60_control.py probe-channels --source <tenant-source> --output-dir /tmp/cb60-probe
 python3 scripts/cb60_capture_workflow.py init-session --brief '门头, 店内全景, 商品近景'
 python3 scripts/cb60_capture_workflow.py next-shot --session ./artifacts/workflows/<session>/session.json
-python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/workflows/<session>/session.json --stream-url '<flv-or-hls-url>' --rotation cw90
+python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/workflows/<session>/session.json --rotation cw90
 python3 scripts/cb60_task_manager.py init-task --task-root ./artifacts/task-manager/store-a --start-time 11:00 --end-time 12:00 --brief '门头, 店内全景'
 python3 scripts/cb60_task_manager.py first-boot-setup --task-root ./artifacts/task-manager/store-a --time-window-text '11:00-12:00'
 python3 scripts/cb60_task_manager.py merchant-command --task ./artifacts/task-manager/store-a/task.json --text '龙虾，怎么没有拍摄，帮我找找问题'
@@ -271,13 +271,13 @@ Run commands from:
 12. If the user wants a lightweight shoot flow, create a local session with `init-session` and keep the shot count at 3 or 4 maximum.
 13. Use the generated shot order to reduce repositioning. The workflow intentionally groups shots by zone before capture.
 14. After each capture, read the next instruction from `capture-shot` or `next-shot` instead of asking for repeated confirmations.
-15. For OpenClaw-style runtime environments, the workflow should default to HLS first instead of FLV, because HLS has proven more stable than FLV `:9188` in those environments.
-16. If `EZVIZ_MANAGED_STREAM_ID` is set, the workflow should prefer that long-lived managed stream and fetch a fresh playback address from it instead of creating or assuming a temporary live address. Managed streams should also default to `HLS` first (`EZVIZ_MANAGED_STREAM_PROTOCOL=1`) and request `supportH265=1` by default unless the user explicitly overrides it.
+15. For OpenClaw-style runtime environments, the workflow should use a single fixed capture path: managed-stream address -> HLS -> `supportH265=1`. Do not keep a FLV-first or H264-compatible-first path in the capture workflow.
+16. If `EZVIZ_MANAGED_STREAM_ID` is set, the workflow should reuse that long-lived managed stream and fetch a fresh HLS playback address from it. If no long-lived managed stream is configured, create a temporary stream and still resolve the HLS address through `stream-address`.
 17. The workflow now tries to auto-convert recorded clips into rotated `.mp4` output when `ffmpeg` is available. The default is `cw90`, which turns a landscape source into portrait output.
 18. If conversion fails or `ffmpeg` is missing, it safely falls back to the original recorded container.
-19. When no direct `--stream-url` and no managed stream are provided, the workflow should default to `protocol=1`, `quality=1`, `supportH265=0`, and `type=1` so OpenClaw first tries the H264-compatible HLS address shape. The `source` parameter should use adaptive retry: retry with `source=1` only when the API says `source` is missing, and retry without `source` when the API says the field is invalid.
-20. If the first automatic capture still produces a low-resolution clip, placeholder-like result, or otherwise fails validation, the workflow should automatically retry once with `H265 + HLS` main-stream settings and keep the retried result only when it passes validation. OpenClaw should not manually flip these knobs at runtime.
-21. Before recording, the workflow should check the primary stream video encode. If the device explicitly reports `H265` (`videoCode=5`), try the official encode-switch API once to move it to `H264`. If the device does not support the command or the switch fails, record that in the workflow log and continue. For the current CB60 managed-stream path, `H265 + HLS -> local H264 MP4` is an accepted steady-state fallback.
+19. For capture workflow runs, do not call direct `live-url` as the primary acquisition path, and do not keep a `supportH265=0` first pass. The capture workflow should directly request `protocol=1`, `quality=1`, `supportH265=1`, and `type=1` through `stream-address`.
+20. OpenClaw should not manually flip protocol / source / supportH265 knobs at runtime. If capture fails, read the workflow logs; do not fall back to ad-hoc direct live probing.
+21. For the current CB60 managed-stream path, do not attempt device-side H264 encode switching in the capture workflow. The fixed steady-state path is `H265 + HLS -> local H264 MP4`.
 22. If a manually fetched or automatically fetched FLV URL fails with `502`, `Bad Gateway`, or a port-9188 connectivity error, do not immediately conclude that the server IP is banned. Let `capture-shot` own the retry/fallback path first. If manual intervention is still required, switch to `HLS` rather than stopping at the FLV diagnosis.
 23. For capture jobs, `capture-shot` is the only supported recording entrypoint. Do not use `live-url`, handwritten `python -c`, `curl`, or ad-hoc API probes to replace the capture workflow.
 24. If `capture-shot` fails, read `capture-log.jsonl`, `capture-report.md`, and `session.json` for diagnosis. Do not manually derive stream URLs or jump to network-ban / CDN-failure conclusions from partial probes.

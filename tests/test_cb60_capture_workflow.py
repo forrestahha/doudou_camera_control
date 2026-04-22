@@ -33,7 +33,6 @@ from cb60_capture_workflow import (  # noqa: E402
     build_las_postprocess_state,
     classify_capture_output,
     capture_next_shot,
-    ensure_primary_stream_h264,
     extract_failure_frame,
     init_session,
     load_session,
@@ -44,7 +43,6 @@ from cb60_capture_workflow import (  # noqa: E402
     record_flv_clip,
     record_hls_clip,
     resolve_stream_url,
-    should_retry_with_h265_hls,
     session_summary,
     stream_url_path,
 )
@@ -98,7 +96,7 @@ class WorkflowTests(unittest.TestCase):
 
             def get_stream_address(self, **kwargs):
                 self.kwargs = kwargs
-                return {"address": "https://demo/live.flv?sid=managed"}
+                return {"address": "https://demo/live.m3u8?sid=managed&supportH265=1"}
 
         config = EnvConfig(
             access_token="t",
@@ -113,19 +111,26 @@ class WorkflowTests(unittest.TestCase):
         finally:
             workflow.EzvizClient = old_client
 
-        self.assertEqual(resolved, "https://demo/live.flv?sid=managed")
-        self.assertEqual(fake_client.kwargs["support_h265"], 0)
+        self.assertEqual(resolved, "https://demo/live.m3u8?sid=managed&supportH265=1")
+        self.assertEqual(fake_client.kwargs["protocol"], 1)
+        self.assertEqual(fake_client.kwargs["support_h265"], 1)
 
-    def test_resolve_stream_url_defaults_to_hls_protocol_for_live_lookup(self):
+    def test_resolve_stream_url_creates_temporary_managed_stream_when_not_configured(self):
         import cb60_capture_workflow as workflow
 
         class FakeClient:
             def __init__(self, config):
                 self.config = config
+                self.create_kwargs = None
+                self.address_kwargs = None
 
-            def get_live_url(self, **kwargs):
-                self.kwargs = kwargs
-                return {"stream_url": "https://demo/live.flv?sid=direct"}
+            def create_stream(self, **kwargs):
+                self.create_kwargs = kwargs
+                return {"stream_id": "stream-temp"}
+
+            def get_stream_address(self, **kwargs):
+                self.address_kwargs = kwargs
+                return {"address": "https://demo/live.m3u8?sid=temp&supportH265=1"}
 
         config = EnvConfig(
             access_token="t",
@@ -139,112 +144,30 @@ class WorkflowTests(unittest.TestCase):
         finally:
             workflow.EzvizClient = old_client
 
-        self.assertEqual(resolved, "https://demo/live.flv?sid=direct")
-        self.assertIsNone(fake_client.kwargs["source"])
-        self.assertEqual(fake_client.kwargs["protocol_id"], 1)
-        self.assertEqual(fake_client.kwargs["quality"], 1)
-        self.assertEqual(fake_client.kwargs["support_h265"], 0)
-        self.assertEqual(fake_client.kwargs["mute"], 0)
-        self.assertEqual(fake_client.kwargs["address_type"], 1)
-
-    def test_resolve_stream_url_falls_back_to_temporary_managed_stream_when_live_lookup_fails(self):
-        import cb60_capture_workflow as workflow
-
-        class FakeClient:
-            def __init__(self, config):
-                self.config = config
-                self.create_kwargs = None
-                self.address_kwargs = None
-
-            def get_live_url(self, **kwargs):
-                raise EzvizError("Failed to get live stream URL.")
-
-            def create_stream(self, **kwargs):
-                self.create_kwargs = kwargs
-                return {"stream_id": "stream-123"}
-
-            def get_stream_address(self, **kwargs):
-                self.address_kwargs = kwargs
-                return {"address": "https://demo/live.m3u8?sid=managed"}
-
-        config = EnvConfig(access_token="t", device_serial="d")
-        fake_client = FakeClient(config)
-        old_client = workflow.EzvizClient
-        old_time = workflow.time.time
-        try:
-            workflow.EzvizClient = lambda config: fake_client
-            workflow.time.time = lambda: time.mktime(time.strptime("2026-04-20 10:00:00", "%Y-%m-%d %H:%M:%S"))
-            resolved = resolve_stream_url(config)
-        finally:
-            workflow.EzvizClient = old_client
-            workflow.time.time = old_time
-
-        self.assertEqual(resolved, "https://demo/live.m3u8?sid=managed")
-        self.assertEqual(
-            fake_client.create_kwargs,
-            {
-                "start_time": "2026-04-20 10:00:00",
-                "end_time": "2026-04-20 12:00:00",
-            },
-        )
-        self.assertEqual(fake_client.address_kwargs["stream_id"], "stream-123")
+        self.assertEqual(resolved, "https://demo/live.m3u8?sid=temp&supportH265=1")
+        self.assertEqual(fake_client.create_kwargs.keys(), {"start_time", "end_time"})
+        self.assertEqual(fake_client.address_kwargs["stream_id"], "stream-temp")
         self.assertEqual(fake_client.address_kwargs["protocol"], 1)
-        self.assertEqual(fake_client.address_kwargs["support_h265"], 0)
+        self.assertEqual(fake_client.address_kwargs["support_h265"], 1)
 
-    def test_ensure_primary_stream_h264_switches_when_device_reports_h265(self):
+    def test_resolve_stream_url_rejects_non_hls_or_non_h265_capture_chain(self):
         import cb60_capture_workflow as workflow
 
         class FakeClient:
             def __init__(self, config):
                 self.config = config
-                self.switched = False
-
-            def get_video_encode(self, stream_type=1):
-                return {"video_code": 5}
-
-            def set_video_encode(self, encode_type, channel_no=None):
-                self.switched = True
-                return {"encode_type": encode_type}
 
         config = EnvConfig(access_token="t", device_serial="d")
         fake_client = FakeClient(config)
         old_client = workflow.EzvizClient
         try:
             workflow.EzvizClient = lambda config: fake_client
-            result = ensure_primary_stream_h264(config)
+            with self.assertRaises(EzvizError):
+                resolve_stream_url(config, protocol_id=4)
+            with self.assertRaises(EzvizError):
+                resolve_stream_url(config, support_h265=0)
         finally:
             workflow.EzvizClient = old_client
-
-        self.assertTrue(result["checked"])
-        self.assertTrue(result["changed"])
-        self.assertEqual(result["status"], "switched")
-        self.assertTrue(fake_client.switched)
-
-    def test_ensure_primary_stream_h264_tolerates_unsupported_switch(self):
-        import cb60_capture_workflow as workflow
-
-        class FakeClient:
-            def __init__(self, config):
-                self.config = config
-
-            def get_video_encode(self, stream_type=1):
-                return {"video_code": 5}
-
-            def set_video_encode(self, encode_type, channel_no=None):
-                raise EzvizError("60020: 不支持该命令")
-
-        config = EnvConfig(access_token="t", device_serial="d")
-        old_client = workflow.EzvizClient
-        try:
-            workflow.EzvizClient = lambda config: FakeClient(config)
-            result = ensure_primary_stream_h264(config)
-        finally:
-            workflow.EzvizClient = old_client
-
-        self.assertTrue(result["checked"])
-        self.assertFalse(result["changed"])
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("60020", result["reason"])
 
     def test_plan_shots_caps_at_four_and_groups_by_zone(self):
         shots = plan_shots("商品近景, 门头, 制作过程, 收银台, 店内全景", max_shots=4)
@@ -466,6 +389,7 @@ class WorkflowTests(unittest.TestCase):
                 payload = capture_next_shot(
                     session_path=session_path,
                     config=EnvConfig(access_token="t", device_serial="d", manual_live_url="https://demo/live.m3u8"),
+                    stream_url="https://demo/live.m3u8",
                     transcode_func=fake_transcode,
                     probe_func=lambda _path: {
                         "duration_seconds": 15.0,
@@ -482,63 +406,7 @@ class WorkflowTests(unittest.TestCase):
                 workflow.fetch_bytes = old_fetcher
                 workflow.record_hls_clip = old_record
 
-    def test_capture_next_shot_retries_hls_when_auto_flv_recording_fails(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            session = init_session("门头", Path(tmp))
-            session_path = Path(session["storage_root"]) / "session.json"
-            import cb60_capture_workflow as workflow
-
-            old_resolve = workflow.resolve_stream_url
-            old_record = workflow.record_stream_clip
-            try:
-                resolved_urls = iter(["https://demo/live.flv", "https://demo/live.m3u8"])
-                calls = []
-
-                def fake_resolve(*args, **kwargs):
-                    return next(resolved_urls)
-
-                def fake_record(stream_url: str, output_path: Path, *args, **kwargs):
-                    calls.append(stream_url)
-                    if stream_url.endswith(".flv"):
-                        raise RuntimeError("flv failed")
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    output_path.write_bytes(b"TS")
-                    return {
-                        "output_path": str(output_path),
-                        "captured_duration_seconds": 15.0,
-                        "segment_count": 1,
-                        "source_protocol": "hls",
-                    }
-
-                workflow.resolve_stream_url = fake_resolve
-                workflow.record_stream_clip = fake_record
-
-                def fake_transcode(input_path: Path, rotation_mode: str):
-                    output_path = input_path.with_suffix(".mp4")
-                    output_path.write_bytes(b"MP4")
-                    return {"ok": True, "output_path": str(output_path), "layout": rotation_mode}
-
-                payload = capture_next_shot(
-                    session_path=session_path,
-                    config=EnvConfig(access_token="t", device_serial="d"),
-                    transcode_func=fake_transcode,
-                    probe_func=lambda _: {"duration_seconds": 15.0, "width": 1080, "height": 1920},
-                )
-            finally:
-                workflow.resolve_stream_url = old_resolve
-                workflow.record_stream_clip = old_record
-
-            self.assertEqual(calls, ["https://demo/live.flv", "https://demo/live.m3u8"])
-            self.assertEqual(payload["captured_shot"]["status"], "captured")
-            log_text = (Path(session["storage_root"]) / "capture-log.jsonl").read_text(encoding="utf-8")
-            self.assertIn("flv_failed_retry_hls", log_text)
-
             reloaded = load_session(session_path)
-            self.assertEqual(reloaded["shots"][0]["status"], "captured")
-            self.assertIn("next_instruction", payload)
-            self.assertTrue(Path(reloaded["shots"][0]["output_path"]).exists())
-            self.assertTrue(reloaded["shots"][0]["output_path"].endswith(".mp4"))
-            self.assertTrue(reloaded["shots"][0]["raw_output_path"].endswith(".ts"))
             self.assertRegex(Path(reloaded["shots"][0]["output_path"]).name, r"01-storefront-\d{8}-\d{6}\.mp4")
             self.assertRegex(Path(reloaded["shots"][0]["raw_output_path"]).name, r"01-storefront-\d{8}-\d{6}\.ts")
             self.assertTrue(payload["conversion"]["ok"])
@@ -586,7 +454,7 @@ class WorkflowTests(unittest.TestCase):
                 workflow.record_stream_clip = old_record
 
             log_text = (Path(session["storage_root"]) / "capture-log.jsonl").read_text(encoding="utf-8")
-            self.assertIn("capture_timed_out", log_text)
+            self.assertIn("capture_started", log_text)
             reloaded = load_session(session_path)
             self.assertEqual(reloaded["shots"][0]["status"], "pending")
 
@@ -649,6 +517,7 @@ class WorkflowTests(unittest.TestCase):
                 payload = capture_next_shot(
                     session_path=session_path,
                     config=EnvConfig(access_token="t", device_serial="d", manual_live_url="https://demo/live.m3u8"),
+                    stream_url="https://demo/live.m3u8",
                     transcode_func=lambda *_: {"ok": False, "reason": "ffmpeg_not_found"},
                     probe_func=lambda _path: {
                         "duration_seconds": 15.0,
@@ -714,6 +583,7 @@ class WorkflowTests(unittest.TestCase):
                 payload = capture_next_shot(
                     session_path=session_path,
                     config=EnvConfig(access_token="t", device_serial="d", manual_live_url="https://demo/live.m3u8"),
+                    stream_url="https://demo/live.m3u8",
                     transcode_func=fake_transcode,
                     probe_func=lambda _path: {
                         "duration_seconds": 6.0,
@@ -739,7 +609,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(reloaded["shots"][0]["postprocess"]["status"], "skipped_capture_not_accepted")
             self.assertEqual(payload["captured_shot"]["validation"]["status"], "abnormal")
 
-    def test_capture_next_shot_retries_h265_hls_when_initial_capture_is_low_quality(self):
+    def test_capture_next_shot_uses_single_managed_stream_h265_hls_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = init_session("门头", Path(tmp))
             session_path = Path(session["storage_root"]) / "session.json"
@@ -760,9 +630,7 @@ class WorkflowTests(unittest.TestCase):
                             "support_h265": support_h265,
                         }
                     )
-                    if support_h265 == 1:
-                        return "https://demo/live-h265.m3u8"
-                    return "https://demo/live.flv"
+                    return "https://demo/live-h265.m3u8"
 
                 def fake_record(stream_url: str, output_path: Path, *args, **kwargs):
                     record_calls.append(stream_url)
@@ -814,17 +682,15 @@ class WorkflowTests(unittest.TestCase):
                 workflow.record_stream_clip = old_record
 
             reloaded = load_session(session_path)
-            self.assertEqual(record_calls, ["https://demo/live.flv", "https://demo/live-h265.m3u8"])
+            self.assertEqual(record_calls, ["https://demo/live-h265.m3u8"])
             self.assertEqual(resolve_calls[0]["support_h265"], None)
-            self.assertEqual(resolve_calls[1]["protocol_id"], 1)
-            self.assertEqual(resolve_calls[1]["support_h265"], 1)
-            self.assertTrue(payload["captured_shot"]["adaptive_retry_applied"])
+            self.assertFalse(payload["captured_shot"]["adaptive_retry_applied"])
             self.assertEqual(payload["captured_shot"]["validation"]["status"], "accepted")
             self.assertEqual(reloaded["shots"][0]["validation"]["status"], "accepted")
-            self.assertTrue(reloaded["shots"][0]["adaptive_retry_applied"])
+            self.assertFalse(reloaded["shots"][0]["adaptive_retry_applied"])
             log_text = (Path(session["storage_root"]) / "capture-log.jsonl").read_text(encoding="utf-8")
-            self.assertIn("validation_failed_retry_h265_hls", log_text)
-            self.assertIn("adaptive_h265_hls_retry_succeeded", log_text)
+            self.assertNotIn("validation_failed_retry_h265_hls", log_text)
+            self.assertNotIn("adaptive_h265_hls_retry_succeeded", log_text)
 
     def test_build_las_postprocess_state_marks_pending_config_for_accepted_clip(self):
         session = init_session("门头", Path(tempfile.mkdtemp()))
@@ -942,23 +808,6 @@ class WorkflowTests(unittest.TestCase):
             ),
             "accepted",
         )
-
-    def test_should_retry_with_h265_hls_for_low_quality_or_short_clip(self):
-        self.assertTrue(
-            should_retry_with_h265_hls(
-                {"duration_seconds": 6.0, "width": 288, "height": 512, "video_codec": "h264"},
-                20,
-                "abnormal",
-            )
-        )
-        self.assertFalse(
-            should_retry_with_h265_hls(
-                {"duration_seconds": 20.0, "width": 1080, "height": 1920, "video_codec": "h264"},
-                20,
-                "accepted",
-            )
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

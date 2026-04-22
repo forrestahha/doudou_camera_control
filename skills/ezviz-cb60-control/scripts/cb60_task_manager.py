@@ -172,9 +172,8 @@ def workflow_spec() -> JsonDict:
             "default_live_chain": {
                 "protocol": 1,
                 "quality": 1,
-                "supportH265": 0,
-                "source_strategy": "adaptive_retry",
-                "validation_retry_strategy": "retry_h265_hls_once_when_low_quality_or_abnormal",
+                "supportH265": 1,
+                "stream_resolution_strategy": "managed_stream_address_only",
                 "type": 1,
             },
             "managed_stream_default_chain": {
@@ -186,6 +185,7 @@ def workflow_spec() -> JsonDict:
             },
             "runtime_contract": [
                 "拍摄执行入口固定为 python3 scripts/cb60_capture_workflow.py capture-shot --session <session.json>。",
+                "Capture workflow 固定使用 managed-stream address -> HLS -> supportH265=1；如果没有长期 managed stream，就先创建临时 stream，再走同一条地址获取链路。",
                 "OpenClaw 不要用 live-url、curl、手写 python -c 或临时 curl 诊断来替代 capture-shot。",
                 "如果 capture-shot 失败，只读取 capture-log.jsonl 和 capture-report.md，再按失败原因汇报；不要自行推断 IP 被封、CDN 故障或安全组问题。",
             ],
@@ -194,7 +194,8 @@ def workflow_spec() -> JsonDict:
                 "录后自动验片。",
                 "验片主规则以时长和分辨率为准；达到 10 秒且分辨率达标即可 accepted。",
                 "tesseract 只用于异常帧 OCR 分析，不是 accepted 的前置条件。",
-                "长期 managed stream 默认优先走 HLS + supportH265=1；如果录制成功，最终交付仍统一转成 H264 MP4。",
+                "当前唯一稳定取流路径是 managed stream HLS + supportH265=1；如果没有长期 streamId，就自动创建临时 stream 后继续走同一路径。",
+                "录制成功后最终交付统一转成 H264 MP4。",
                 "失败或异常时自动截帧并补图像分析。",
                 "验片通过后自动进入 LAS 顺序：高光剪辑 -> 去水印 -> 变高清。",
                 "LAS 步骤必须复用本地已安装 skill，不允许 OpenClaw 自己实现 LAS 认证与请求签名。",

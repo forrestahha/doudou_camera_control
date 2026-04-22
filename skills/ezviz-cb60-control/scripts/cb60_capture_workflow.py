@@ -27,13 +27,10 @@ JsonDict = Dict[str, Any]
 RotationMode = str
 DEFAULT_LIVE_PROTOCOL_ID = 1
 DEFAULT_LIVE_QUALITY = 1
-DEFAULT_LIVE_SUPPORT_H265 = 0
+DEFAULT_LIVE_SUPPORT_H265 = 1
 DEFAULT_LIVE_MUTE = 0
 DEFAULT_LIVE_ADDRESS_TYPE = 1
 DEFAULT_TEMP_STREAM_WINDOW_SECONDS = 7200
-ADAPTIVE_RETRY_PROTOCOL_ID = 1
-ADAPTIVE_RETRY_SUPPORT_H265 = 1
-VIDEO_CODE_H265 = {5, "5", "H265", "h265"}
 DEFAULT_LOG_NAME = "capture-log.jsonl"
 DEFAULT_REPORT_NAME = "capture-report.md"
 LAS_PIPELINE_SKILL_ORDER: Tuple[Tuple[str, str], ...] = (
@@ -549,91 +546,43 @@ def resolve_stream_url(
     protocol_id: Optional[int] = None,
     support_h265: Optional[int] = None,
 ) -> str:
+    del source
     client = EzvizClient(config)
-    if config.managed_stream_id:
-        managed = client.get_stream_address(
-            stream_id=config.managed_stream_id,
-            protocol=config.managed_stream_protocol,
-            quality=config.managed_stream_quality,
-            support_h265=0 if support_h265 is None else support_h265,
-            mute=config.managed_stream_mute,
-        )
-        stream_url = managed["address"]
-        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
-            raise EzvizError("Managed stream address did not return a supported HLS or FLV URL.")
-        return stream_url
-
     effective_protocol_id = protocol_id if protocol_id is not None else DEFAULT_LIVE_PROTOCOL_ID
     effective_support_h265 = DEFAULT_LIVE_SUPPORT_H265 if support_h265 is None else support_h265
-    try:
-        live = client.get_live_url(
-            source=source,
-            protocol_id=effective_protocol_id,
-            quality=DEFAULT_LIVE_QUALITY,
-            support_h265=effective_support_h265,
-            mute=DEFAULT_LIVE_MUTE,
-            address_type=DEFAULT_LIVE_ADDRESS_TYPE,
-        )
-        stream_url = live["stream_url"]
-        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
-            raise EzvizError("The workflow recorder currently supports HLS (.m3u8) and FLV (.flv) stream URLs only.")
-        return stream_url
-    except EzvizError as live_error:
-        now_ts = time.time()
-        start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts))
-        end_time = time.strftime(
-            "%Y-%m-%d %H:%M:%S",
-            time.localtime(now_ts + DEFAULT_TEMP_STREAM_WINDOW_SECONDS),
-        )
-        stream = client.create_stream(start_time=start_time, end_time=end_time)
-        stream_id = stream.get("stream_id")
-        if not isinstance(stream_id, str) or not stream_id:
-            raise EzvizError(f"Failed to get live stream URL and temporary stream fallback did not return a streamId. Original error: {live_error}")
+    if effective_protocol_id != 1:
+        raise EzvizError("Capture workflow now requires HLS stream-address resolution (protocol_id=1).")
+    if effective_support_h265 != 1:
+        raise EzvizError("Capture workflow now requires support_h265=1.")
+
+    def resolve_managed_address(stream_id: str) -> str:
         managed = client.get_stream_address(
             stream_id=stream_id,
             protocol=effective_protocol_id,
-            quality=DEFAULT_LIVE_QUALITY,
+            quality=config.managed_stream_quality,
             support_h265=effective_support_h265,
-            mute=DEFAULT_LIVE_MUTE,
+            mute=config.managed_stream_mute,
             address_type=DEFAULT_LIVE_ADDRESS_TYPE,
         )
         stream_url = managed["address"]
-        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith((".m3u8", ".flv")):
-            raise EzvizError(
-                "Failed to get live stream URL and temporary managed stream fallback returned an unsupported address."
-            )
+        if not isinstance(stream_url, str) or not stream_url_path(stream_url).endswith(".m3u8"):
+            raise EzvizError("Managed stream address did not return a supported HLS (.m3u8) URL.")
         return stream_url
 
+    if config.managed_stream_id:
+        return resolve_managed_address(config.managed_stream_id)
 
-def ensure_primary_stream_h264(config: EnvConfig) -> JsonDict:
-    client = EzvizClient(config)
-    payload = {
-        "checked": False,
-        "changed": False,
-        "target": "H264",
-        "status": "skipped",
-        "reason": "",
-        "video_code": None,
-    }
-    try:
-        encode_info = client.get_video_encode(stream_type=1)
-        video_code = encode_info.get("video_code")
-        payload["checked"] = True
-        payload["video_code"] = video_code
-        if video_code not in VIDEO_CODE_H265:
-            payload["status"] = "already_h264_or_unknown"
-            payload["reason"] = "Primary stream is not explicitly reported as H265; no encode switch needed."
-            return payload
-        switch_result = client.set_video_encode("H264")
-        payload["changed"] = True
-        payload["status"] = "switched"
-        payload["reason"] = "Primary stream reported H265 and was switched to H264."
-        payload["switch_result"] = switch_result
-        return payload
-    except EzvizError as exc:
-        payload["status"] = "failed"
-        payload["reason"] = str(exc)
-        return payload
+    now_ts = time.time()
+    start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts))
+    end_time = time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime(now_ts + DEFAULT_TEMP_STREAM_WINDOW_SECONDS),
+    )
+    stream = client.create_stream(start_time=start_time, end_time=end_time)
+    stream_id = stream.get("stream_id")
+    if not isinstance(stream_id, str) or not stream_id:
+        raise EzvizError("Temporary managed stream fallback did not return a streamId.")
+    return resolve_managed_address(stream_id)
 
 
 def build_raw_recording_path(output_path: Path, stream_url: str) -> Path:
@@ -739,27 +688,6 @@ def classify_capture_output(metrics: JsonDict, target_duration: int) -> str:
     if duration > 0.0:
         return "abnormal"
     return "failed"
-
-
-def should_retry_with_h265_hls(metrics: JsonDict, target_duration: int, validation_status: str) -> bool:
-    if validation_status == "accepted":
-        return False
-    if not metrics:
-        return True
-
-    duration = float(metrics.get("duration_seconds", 0.0) or 0.0)
-    width = int(metrics.get("width", 0) or 0)
-    height = int(metrics.get("height", 0) or 0)
-    short_edge = min(width, height) if width and height else 0
-    minimum_useful_duration = max(float(target_duration) - 4.0, float(target_duration) * 0.7)
-
-    if duration <= 0.0:
-        return True
-    if short_edge and short_edge < 720:
-        return True
-    if duration < minimum_useful_duration:
-        return True
-    return validation_status in {"abnormal", "failed"}
 
 
 def has_las_postprocess_config(config: EnvConfig) -> bool:
@@ -1043,8 +971,8 @@ def render_workflow_report(session: JsonDict, session_path: Path) -> Path:
         f"- Brief: {session.get('brief')}",
         f"- Created at: {session.get('created_at')}",
         f"- Storage root: {session.get('storage_root')}",
-        "- Default direct live chain: protocol=1, quality=1, supportH265=0, type=1; source uses adaptive retry (empty -> 1, illegal -> omitted)",
-        "- Default managed stream chain: protocol=1, quality=1, supportH265=1, type=1; if recording succeeds, the final local deliverable is still transcoded to H264 MP4.",
+        "- Capture stream chain: managed-stream address only, protocol=1, quality=1, supportH265=1, type=1.",
+        "- If a long-lived managed stream is configured, the workflow reuses it; otherwise it creates a temporary stream and still resolves HLS through stream-address. The final local deliverable is transcoded to H264 MP4.",
         f"- Accepted shots: {accepted_count}",
         f"- Abnormal shots: {abnormal_count}",
         f"- Failed shots: {failed_count}",
@@ -1434,18 +1362,6 @@ def capture_next_shot(
             save_session(session_path, session)
             raise
 
-    encode_preflight = ensure_primary_stream_h264(config)
-    log_func(
-        session,
-        session_path,
-        "video_encode_preflight",
-        {
-            "shot_index": shot["index"],
-            "shot_id": shot["shot_id"],
-            "result": encode_preflight,
-        },
-    )
-
     check_deadline("resolve stream")
     try:
         effective_stream_url = stream_url or resolve_stream_url(config, source=source, protocol_id=protocol_id)
@@ -1458,11 +1374,12 @@ def capture_next_shot(
                 "shot_index": shot["index"],
                 "shot_id": shot["shot_id"],
                 "reason": str(exc),
-                "default_live_chain": {
+                "capture_stream_chain": {
                     "protocol": DEFAULT_LIVE_PROTOCOL_ID,
                     "quality": DEFAULT_LIVE_QUALITY,
                     "support_h265": DEFAULT_LIVE_SUPPORT_H265,
                     "type": DEFAULT_LIVE_ADDRESS_TYPE,
+                    "strategy": "managed_stream_address_only",
                 },
             },
         )
@@ -1480,11 +1397,12 @@ def capture_next_shot(
             "shot_id": shot["shot_id"],
             "rotation_mode": rotation_mode,
             "stream_url": effective_stream_url,
-            "default_live_chain": {
+            "capture_stream_chain": {
                 "protocol": DEFAULT_LIVE_PROTOCOL_ID,
                 "quality": DEFAULT_LIVE_QUALITY,
                 "support_h265": DEFAULT_LIVE_SUPPORT_H265,
                 "type": DEFAULT_LIVE_ADDRESS_TYPE,
+                "strategy": "managed_stream_address_only",
             },
             "wall_timeout": {
                 "mode": deadline.mode,
@@ -1500,42 +1418,13 @@ def capture_next_shot(
         ".ts",
     )
     raw_output_path = build_raw_recording_path(base_output_path, effective_stream_url)
-    try:
-        result = record_stream_clip(
-            stream_url=effective_stream_url,
-            output_path=raw_output_path,
-            target_duration=float(shot["duration_seconds"]),
-            timeout_seconds=config.timeout_seconds,
-            max_runtime_seconds=deadline.bounded_timeout(max(float(shot["duration_seconds"]) + 20.0, 30.0), "record stream"),
-        )
-    except Exception as exc:
-        if deadline.remaining_seconds() <= 0:
-            check_deadline("record stream")
-        if stream_url or protocol_id is not None or not stream_url_path(effective_stream_url).endswith(".flv"):
-            raise
-        check_deadline("resolve fallback stream")
-        fallback_stream_url = resolve_stream_url(config, source=source, protocol_id=1)
-        check_deadline("record fallback stream")
-        log_func(
-            session,
-            session_path,
-            "flv_failed_retry_hls",
-            {
-                "shot_index": shot["index"],
-                "shot_id": shot["shot_id"],
-                "reason": str(exc),
-                "fallback_stream_url": fallback_stream_url,
-            },
-        )
-        effective_stream_url = fallback_stream_url
-        raw_output_path = build_raw_recording_path(base_output_path, effective_stream_url)
-        result = record_stream_clip(
-            stream_url=effective_stream_url,
-            output_path=raw_output_path,
-            target_duration=float(shot["duration_seconds"]),
-            timeout_seconds=config.timeout_seconds,
-            max_runtime_seconds=deadline.bounded_timeout(max(float(shot["duration_seconds"]) + 20.0, 30.0), "record fallback stream"),
-        )
+    result = record_stream_clip(
+        stream_url=effective_stream_url,
+        output_path=raw_output_path,
+        target_duration=float(shot["duration_seconds"]),
+        timeout_seconds=config.timeout_seconds,
+        max_runtime_seconds=deadline.bounded_timeout(max(float(shot["duration_seconds"]) + 20.0, 30.0), "record stream"),
+    )
     check_deadline("transcode recording")
     conversion = transcode_func(Path(result["output_path"]), rotation_mode)
     check_deadline("probe recording")
@@ -1564,98 +1453,6 @@ def capture_next_shot(
         failure_analysis = analyze_failure_func(frame_path, metrics)
 
     adaptive_retry_applied = False
-    if (
-        validation_status != "accepted"
-        and not stream_url
-        and protocol_id is None
-        and should_retry_with_h265_hls(metrics, int(shot["duration_seconds"]), validation_status)
-    ):
-        check_deadline("resolve adaptive h265 hls retry")
-        retry_stream_url = resolve_stream_url(
-            config,
-            source=source,
-            protocol_id=ADAPTIVE_RETRY_PROTOCOL_ID,
-            support_h265=ADAPTIVE_RETRY_SUPPORT_H265,
-        )
-        retry_capture_timestamp = build_capture_timestamp()
-        log_func(
-            session,
-            session_path,
-            "validation_failed_retry_h265_hls",
-            {
-                "shot_index": shot["index"],
-                "shot_id": shot["shot_id"],
-                "previous_validation_status": validation_status,
-                "previous_metrics": metrics,
-                "retry_stream_url": retry_stream_url,
-                "retry_protocol": ADAPTIVE_RETRY_PROTOCOL_ID,
-                "retry_support_h265": ADAPTIVE_RETRY_SUPPORT_H265,
-            },
-        )
-        retry_base_output_path = build_timestamped_shot_path(
-            session_path.parent / "shots",
-            int(shot["index"]),
-            str(shot["shot_id"]),
-            retry_capture_timestamp,
-            ".ts",
-        )
-        retry_raw_output_path = build_raw_recording_path(retry_base_output_path, retry_stream_url)
-        check_deadline("record adaptive h265 hls retry")
-        retry_result = record_stream_clip(
-            stream_url=retry_stream_url,
-            output_path=retry_raw_output_path,
-            target_duration=float(shot["duration_seconds"]),
-            timeout_seconds=config.timeout_seconds,
-            max_runtime_seconds=deadline.bounded_timeout(
-                max(float(shot["duration_seconds"]) + 20.0, 30.0),
-                "record adaptive h265 hls retry",
-            ),
-        )
-        check_deadline("transcode adaptive h265 hls retry")
-        retry_conversion = transcode_func(Path(retry_result["output_path"]), rotation_mode)
-        retry_final_output_path = retry_result["output_path"]
-        if retry_conversion.get("ok") and isinstance(retry_conversion.get("output_path"), str):
-            retry_final_output_path = retry_conversion["output_path"]
-        check_deadline("probe adaptive h265 hls retry")
-        retry_inspection_path = Path(retry_final_output_path)
-        retry_metrics = probe_func(retry_inspection_path) if retry_inspection_path.exists() else {}
-        retry_validation_status = classify_func(retry_metrics, int(shot["duration_seconds"]))
-        if retry_validation_status == "accepted":
-            adaptive_retry_applied = True
-            effective_stream_url = retry_stream_url
-            capture_timestamp = retry_capture_timestamp
-            result = retry_result
-            conversion = retry_conversion
-            final_output_path = retry_final_output_path
-            inspection_path = retry_inspection_path
-            metrics = retry_metrics
-            validation_status = retry_validation_status
-            frame_path = None
-            failure_analysis = ""
-            log_func(
-                session,
-                session_path,
-                "adaptive_h265_hls_retry_succeeded",
-                {
-                    "shot_index": shot["index"],
-                    "shot_id": shot["shot_id"],
-                    "metrics": retry_metrics,
-                    "final_output_path": retry_final_output_path,
-                },
-            )
-        else:
-            log_func(
-                session,
-                session_path,
-                "adaptive_h265_hls_retry_not_accepted",
-                {
-                    "shot_index": shot["index"],
-                    "shot_id": shot["shot_id"],
-                    "retry_validation_status": retry_validation_status,
-                    "retry_metrics": retry_metrics,
-                    "retry_output_path": retry_final_output_path,
-                },
-            )
 
     if las_enabled:
         session.setdefault("las_pipeline", {})["execution_mode"] = "inline_after_capture"
@@ -1744,9 +1541,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     capture_parser = subparsers.add_parser("capture-shot", help="Record the next planned shot to a local file.")
     capture_parser.add_argument("--session", type=Path, required=True, help="Path to session.json")
-    capture_parser.add_argument("--source", help="Optional live source parameter for the stream API.")
-    capture_parser.add_argument("--protocol-id", type=int, help="Optional numeric protocol value expected by the tenant.")
-    capture_parser.add_argument("--stream-url", help="Optional direct HLS or FLV URL override.")
     capture_parser.add_argument(
         "--rotation",
         default="cw90",
@@ -1802,9 +1596,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             payload = capture_next_shot(
                 session_path=args.session,
                 config=EnvConfig.from_env(env_file=env_file),
-                source=args.source,
-                protocol_id=args.protocol_id,
-                stream_url=args.stream_url,
                 rotation_mode=args.rotation,
             )
         except EzvizError as exc:

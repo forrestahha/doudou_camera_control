@@ -29,7 +29,7 @@
 ## 当前边界
 
 - 设备主码流当前为 `H.265`
-- 设备编码格式查询可用，但当前设备返回 `60020`，不支持通过该接口切到 `H.264`
+- 设备编码格式查询可用，但当前拍摄工作流不再依赖设备侧切换到 `H.264`
 - `REST zoom` 在这台设备上不可用
 - 公开 API 没有确认可直接切换广角 / 3x 镜头
 - 对讲仍停留在 SDK 边界，插件未直接实现
@@ -392,58 +392,24 @@ python3 scripts/cb60_status_monitor.py run --interval-seconds 60 --max-rounds 5
 
 OpenClaw 不应该在现场临时猜这些参数，也不应该边跑边改源码。插件当前已经把默认拍摄策略固化好了：
 
-### 1. 默认优先链路
+### 1. 唯一固定链路
 
-- OpenClaw 默认优先尝试 `HLS`
-- 普通 direct live 链默认参数：
+插件现在只保留一条拍摄链路：
+
+- 统一通过 `stream-address` 取流
+- 优先复用长期 `managed stream`
+- 如果没有配置长期 `streamId`，自动创建临时 stream，再继续走同一条链路
+- 固定参数：
   - `protocol=1`
   - `quality=1`
-  - `supportH265=0`
+  - `supportH265=1`
   - `type=1`
 
-这样做的目的，是先优先请求 **H264 兼容的 HLS 链路**，尽量避开部分 OpenClaw 运行环境下 `FLV :9188` 的连通性问题，同时继续避免直接拿到萤石的 H265 占位图。
+也就是说，OpenClaw 不再先尝试 direct live-url，也不再先打一枪 `supportH265=0` 的兼容流。
 
-- 如果已经配置长期 `managed stream`
-  - 默认也优先使用 `HLS`
-  - 默认参数：
-    - `protocol=1`
-    - `quality=1`
-    - `supportH265=1`
-    - `type=1`
+这样做的目的，是把当前这类**设备不支持编码切换、但 H265 + HLS 能稳定取到主码流**的场景直接固化成唯一稳定路径。
 
-这样做的目的，是对当前这类**设备不支持编码切换、但 H265 + HLS 能稳定取到主码流**的场景，直接走已经验证成功的稳定链路；最终本地仍统一转成 `H264 MP4` 交付。
-
-### 2. `source` 参数自动兼容
-
-不同萤石接口环境对 `source` 的要求不一致，插件已经做了自适应处理：
-
-- 如果接口返回 `source为空`
-  - 插件会自动补 `source=1` 再试
-- 如果接口返回 `source格式非法`
-  - 插件会自动去掉 `source` 再试
-
-OpenClaw 不需要现场手动判断到底该不该传 `source`。
-
-### 3. 首次拍摄异常时的自动救援
-
-如果第一次拍出来的是下面这几类结果：
-
-- 极低分辨率
-- 明显异常短片
-- 未通过验片
-- 很像拿到了占位图或兼容子流
-
-插件会自动再试一次：
-
-- `H265 + HLS`
-- 即：
-  - `protocol=1`
-  - `supportH265=1`
-
-只有第二次验片通过，才会把第二次结果作为最终结果保留下来。  
-所以 OpenClaw 现在不应该再自己去做“先改环境变量、再手动重建流、再手动切协议”这类现场判断。
-
-### 4. 最终交付格式
+### 2. 最终交付格式
 
 不管上游实际拉到的是 H264 还是 H265，插件的最终目标都是：
 
@@ -458,7 +424,7 @@ OpenClaw 不需要现场手动判断到底该不该传 `source`。
 ```bash
 python3 scripts/cb60_capture_workflow.py init-session --brief '门头, 店内全景, 商品近景'
 python3 scripts/cb60_capture_workflow.py next-shot --session ./artifacts/workflows/<session>/session.json
-python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/workflows/<session>/session.json --stream-url '<flv-or-hls-url>'
+python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/workflows/<session>/session.json
 ```
 
 现在 `capture-shot` 会：
@@ -468,37 +434,30 @@ python3 scripts/cb60_capture_workflow.py capture-shot --session ./artifacts/work
 3. 默认输出模式是整体顺时针 `90°`，适合把横屏素材直接变成竖屏
 4. 也支持 `flip180` 这种整体翻转模式
 5. 原始文件保存在 `raw_output_path`
-6. OpenClaw 默认优先使用 `HLS`
-7. 如果设置了 `EZVIZ_MANAGED_STREAM_ID`，工作流会优先复用这条长期 `streamId` 获取最新地址，而不是默认依赖临时取流地址
-   - 长期 `managed stream` 默认优先使用 `HLS`（`EZVIZ_MANAGED_STREAM_PROTOCOL=1`）
-   - 长期 `managed stream` 默认也会优先请求 `supportH265=1`（`EZVIZ_MANAGED_STREAM_SUPPORT_H265=1`）
-8. 如果既没有显式传 `--stream-url`，也没有配置长期 `streamId`，工作流会默认按 `protocol=1 + quality=1 + supportH265=0 + type=1` 现取最新 `HLS` 地址，优先避开部分 OpenClaw 环境下 `FLV :9188` 的连通性问题；`source` 会自适应重试：接口报“source为空”时补 `1`，接口报“source格式非法”时自动去掉
-9. 如果第一次录到的是低分辨率/异常短片/未通过验片，工作流会自动再尝试一次 `H265 + HLS` 主码流；只要第二次通过验片，就自动采用第二次结果，不需要 OpenClaw 现场改参数
-10. 开始录制前，插件会先检查主码流编码；如果设备明确报告当前为 `H265`，会先尝试通过官方编码切换接口改成 `H264`
-11. 如果设备不支持编码切换、设备忙、或切换失败，插件只记日志，不会在这一步直接终止拍摄；这时长期 `managed stream + HLS + supportH265=1` 仍然是默认稳定链路
-12. 拍摄执行入口固定是 `capture-shot`；OpenClaw 不要再用 `live-url`、`curl`、手写 `python -c` 或临时 API 探测来替代主流程
-13. 每次执行都会在 session 目录里写 `capture-log.jsonl` 和 `capture-report.md`
-14. 录后会自动验片；失败或异常时会自动截一帧，并补失败分析说明
-15. 验片通过后，会自动进入 LAS 后处理流水线，固定顺序为：
+6. 取流固定走 `managed stream address -> HLS -> supportH265=1`
+7. 如果设置了 `EZVIZ_MANAGED_STREAM_ID`，工作流会优先复用这条长期 `streamId`
+8. 如果没有配置长期 `streamId`，工作流会自动创建临时 stream，再继续走同一条 `stream-address` 链路
+9. 当前工作流不再尝试设备侧编码切换，直接按 `H265 + HLS` 主码流录制，再本地统一转成 `H264 MP4`
+10. 拍摄执行入口固定是 `capture-shot`；OpenClaw 不要再用 `live-url`、`curl`、手写 `python -c` 或临时 API 探测来替代主流程
+11. 每次执行都会在 session 目录里写 `capture-log.jsonl` 和 `capture-report.md`
+12. 录后会自动验片；失败或异常时会自动截一帧，并补失败分析说明
+13. 验片通过后，会自动进入 LAS 后处理流水线，固定顺序为：
     - 上传到火山 TOS
     - LAS 高光剪辑
     - LAS 去水印
     - LAS 变高清
-16. 单次执行有墙钟上限：默认普通拍摄最多 `180` 秒，含 LAS 全流程最多 `5400` 秒；超时会写入 `capture_timed_out` 日志并停止
-17. 本地文件和云上文件都会带拍摄时间戳
+14. 单次执行有墙钟上限：默认普通拍摄最多 `180` 秒，含 LAS 全流程最多 `5400` 秒；超时会写入 `capture_timed_out` 日志并停止
+15. 本地文件和云上文件都会带拍摄时间戳
 
 ### 插件已经自动处理的常见拍摄异常
 
 OpenClaw 看到下面这些情况时，不应该第一反应是自己改代码或改一堆环境变量；插件已经内置了处理逻辑：
 
-1. `10001: source为空`
-- 插件会自动补 `source=1` 重试
+1. 设备主码流是 `H265`
+- 插件不会再尝试设备侧切到 `H264`，而是直接按固定的 `managed stream + HLS + supportH265=1` 路径录制
 
-2. `10001: source格式非法`
-- 插件会自动去掉 `source` 重试
-
-3. `FLV` 录制超时 / 连不上
-- OpenClaw 默认已经先走 `HLS`；如果你仍手工传了 `FLV` 地址，优先切回插件默认链路，不要停留在 `FLV 502` 的手工排障
+2. `FLV` 录制超时 / 连不上
+- OpenClaw 不应该再手工切回 `FLV` 排障；插件固定链路就是 `HLS`
 - OpenClaw 处理拍摄失败时，不要再用 `live-url`、手写 `python -c`、`curl` 或临时 API 调试脚本来替代 `capture-shot`
 - 正确做法是只读取 `capture-log.jsonl`、`capture-report.md`、`session.json`，按插件日志汇报失败原因
 
@@ -544,10 +503,9 @@ OCR 只用于异常时补充文字分析说明，不是 accepted 的前置条件
 - 本地转竖屏 `H264 MP4`
 - 验片通过条件：时长 `>= 10s` 且分辨率达标
 
-也就是说，这台设备的稳定成功路径不是“必须先切成 H264 再拍”，而是：
+也就是说，这台设备的稳定成功路径不是“先切成 H264 再拍”，而是：
 
-- 优先尝试编码切换到 `H264`
-- 如果设备返回 `60020` 不支持切换，就继续用 `H265 + HLS`
+- 直接使用 `H265 + HLS`
 - 只要录制成功，最终本地统一转成 `H264 MP4`
 
 可通过环境变量调整上限：
@@ -750,9 +708,9 @@ OpenClaw 在运行 `should-run-now` 时，现在要同时判断两件事：
 
 - `protocol=1`
 - `quality=1`
-- `supportH265=0`
-- `source` 自适应重试：先按现有配置请求，必要时补 `1` 或自动去掉
-- 如果第一次低质量 / 异常短片 / 验片失败：自动重试一次 `H265 + HLS`
+- `supportH265=1`
+- 优先复用长期 `managed stream`
+- 如果没有长期 `streamId`，自动创建临时 stream，再继续走 `stream-address`
 - `type=1`
 
 默认 LAS 规则固定为：
