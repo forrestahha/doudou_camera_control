@@ -198,6 +198,8 @@ def workflow_spec() -> JsonDict:
                 "录制成功后最终交付统一转成 H264 MP4。",
                 "失败或异常时自动截帧并补图像分析。",
                 "验片通过后自动进入 LAS 顺序：高光剪辑 -> 去水印 -> 变高清。",
+                "默认 LAS 变高清输出 4K 规格竖屏视频。",
+                "如果设置 CB60_SKIP_LAS_EDIT=1，则测试轮次跳过高光剪辑，直接走 upload_to_tos -> las_video_inpaint -> las_video_resize。",
                 "LAS 步骤必须复用本地已安装 skill，不允许 OpenClaw 自己实现 LAS 认证与请求签名。",
             ],
         },

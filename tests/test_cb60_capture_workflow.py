@@ -43,6 +43,7 @@ from cb60_capture_workflow import (  # noqa: E402
     record_flv_clip,
     record_hls_clip,
     resolve_stream_url,
+    run_las_postprocess_pipeline,
     session_summary,
     stream_url_path,
 )
@@ -746,6 +747,129 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(edit_prefix, "tos://demo-bucket/openclaw/original/session-1/01-round-01/las-edit/")
         self.assertEqual(inpaint_prefix, "tos://demo-bucket/openclaw/original/session-1/02-round-02/las-inpaint/")
+
+    def test_run_las_postprocess_pipeline_can_skip_edit_and_continue(self):
+        import cb60_capture_workflow as workflow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts_root = Path(tmp)
+            session = init_session("门头", artifacts_root)
+            session["session_id"] = "20260423-224500"
+            shot = session["shots"][0]
+            shot["index"] = 1
+            shot["shot_id"] = "custom-1"
+            shot["label"] = "第2轮"
+            shot["request_text"] = "第2轮"
+            shot["capture_timestamp"] = "20260423-224500"
+            final_mp4 = artifacts_root / "accepted.mp4"
+            final_mp4.write_bytes(b"mp4")
+
+            config = EnvConfig(
+                access_token="t",
+                device_serial="d",
+                las_api_key="las-key",
+                las_region="cn-beijing",
+                tos_access_key="tos-ak",
+                tos_secret_key="tos-sk",
+                tos_original="tos://doudou-video/openclaw/store1_jsspa_original/",
+                tos_final="tos://doudou-video/openclaw/store1_jsspa_final/",
+                skip_las_edit=True,
+            )
+
+            old_upload = workflow.upload_local_file_to_tos
+            old_load_skill_module = workflow.load_skill_module
+            old_call_las_skill = workflow.call_las_skill
+            old_wait = workflow.wait_for_poll_completion
+            try:
+                workflow.upload_local_file_to_tos = lambda _config, _local_path, target_tos_url: {
+                    "tos_url": target_tos_url,
+                    "size_bytes": 1234,
+                }
+
+                class FakeInpaintModule:
+                    @staticmethod
+                    def submit_task(*args, **kwargs):
+                        return {}
+
+                    @staticmethod
+                    def poll_task(*args, **kwargs):
+                        return {}
+
+                class FakeResizeModule:
+                    @staticmethod
+                    def submit_task(*args, **kwargs):
+                        return {}
+
+                    @staticmethod
+                    def poll_task(*args, **kwargs):
+                        return {}
+
+                def fake_load_skill_module(name: str, _path: str):
+                    if name == "las_video_edit_skill":
+                        raise AssertionError("skip_las_edit should bypass edit skill loading")
+                    if name == "las_video_inpaint_skill":
+                        return FakeInpaintModule
+                    if name == "las_video_resize_skill":
+                        return FakeResizeModule
+                    raise AssertionError(f"unexpected skill module: {name}")
+
+                submit_calls: list[tuple[str, dict]] = []
+
+                def fake_call_las_skill(_config, func, *args, **kwargs):
+                    submit_calls.append((func.__qualname__, dict(kwargs)))
+                    qualname = func.__qualname__
+                    if "FakeInpaintModule.submit_task" in qualname:
+                        return {"metadata": {"task_id": "inpaint-task"}}
+                    if "FakeResizeModule.submit_task" in qualname:
+                        return {"metadata": {"task_id": "resize-task"}}
+                    raise AssertionError(f"unexpected LAS call: {qualname}")
+
+                poll_results = [
+                    {"data": {"inpainted_video_path": "tos://doudou-video/openclaw/store1_jsspa_original/inpainted.mp4"}},
+                    {"data": {"output_path": "tos://doudou-video/openclaw/store1_jsspa_final/store1_jsspa_20260423_224500_final_01.mp4"}},
+                ]
+
+                workflow.load_skill_module = fake_load_skill_module
+                workflow.call_las_skill = fake_call_las_skill
+                workflow.wait_for_poll_completion = lambda *args, **kwargs: poll_results.pop(0)
+
+                result = workflow.run_las_postprocess_pipeline(
+                    config=config,
+                    session=session,
+                    shot=shot,
+                    final_output_path=str(final_mp4),
+                    validation_status="accepted",
+                    artifacts_root=artifacts_root,
+                )
+            finally:
+                workflow.upload_local_file_to_tos = old_upload
+                workflow.load_skill_module = old_load_skill_module
+                workflow.call_las_skill = old_call_las_skill
+                workflow.wait_for_poll_completion = old_wait
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["steps"][0]["status"], "completed")
+            self.assertEqual(result["steps"][1]["status"], "skipped")
+            self.assertEqual(result["steps"][2]["status"], "completed")
+            self.assertEqual(result["steps"][3]["status"], "completed")
+            self.assertEqual(
+                result["final_tos_path"],
+                "tos://doudou-video/openclaw/store1_jsspa_final/store1_jsspa_20260423_224500_final_01.mp4",
+            )
+            inpaint_call = submit_calls[0]
+            resize_call = submit_calls[1]
+            self.assertEqual(
+                inpaint_call[1]["video_url"],
+                "tos://doudou-video/openclaw/store1_jsspa_original/20260423-224500/01-custom-1/store1_jsspa_20260423_224500_original_01.mp4",
+            )
+            self.assertEqual(
+                resize_call[1]["video_path"],
+                "tos://doudou-video/openclaw/store1_jsspa_original/inpainted.mp4",
+            )
+            self.assertEqual(resize_call[1]["min_width"], 2160)
+            self.assertEqual(resize_call[1]["max_width"], 3840)
+            self.assertEqual(resize_call[1]["min_height"], 3840)
+            self.assertEqual(resize_call[1]["max_height"], 3840)
 
     def test_las_skill_call_context_serializes_env_access_between_threads(self):
         config_a = EnvConfig(las_api_key="key-A", las_region="region-A")

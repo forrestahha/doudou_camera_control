@@ -54,10 +54,10 @@ DEFAULT_LAS_INPAINT_TARGETS: Tuple[str, ...] = ("watermark",)
 DEFAULT_LAS_INPAINT_BACKEND = "pixel_replace"
 # 1000x1000 归一化坐标，默认加强左下角时间水印区域。
 DEFAULT_LAS_INPAINT_FIXED_BBOXES: Tuple[Tuple[int, int, int, int], ...] = ((0, 650, 150, 970),)
-DEFAULT_LAS_RESIZE_MIN_WIDTH = 1440
-DEFAULT_LAS_RESIZE_MAX_WIDTH = 2560
-DEFAULT_LAS_RESIZE_MIN_HEIGHT = 2560
-DEFAULT_LAS_RESIZE_MAX_HEIGHT = 2560
+DEFAULT_LAS_RESIZE_MIN_WIDTH = 2160
+DEFAULT_LAS_RESIZE_MAX_WIDTH = 3840
+DEFAULT_LAS_RESIZE_MIN_HEIGHT = 3840
+DEFAULT_LAS_RESIZE_MAX_HEIGHT = 3840
 DEFAULT_CAPTURE_WALL_TIMEOUT_SECONDS = 180.0
 DEFAULT_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS = 5400.0
 DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS = 3600.0
@@ -1097,6 +1097,7 @@ def run_las_postprocess_pipeline(
         {"step": step_id, "label": label, "status": "pending"}
         for step_id, label in LAS_PIPELINE_SKILL_ORDER
     ]
+    skip_las_edit = bool(getattr(config, "skip_las_edit", False))
     results_dir = artifacts_root / "las-results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1119,49 +1120,59 @@ def run_las_postprocess_pipeline(
         )
         write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-upload.json", upload_info)
 
-        if deadline:
-            deadline.check("LAS highlight submit")
-        edit_module = load_skill_module("las_video_edit_skill", str(LAS_EDIT_SKILL_PATH))
-        edit_submit = call_las_skill(
-            config,
-            edit_module.submit_task,
-            region=config.las_region,
-            video_url=original_tos_url,
-            output_tos_path=edit_output_prefix,
-            task_description=build_las_task_description(shot_label, shot_text),
-            mode="simple",
-            output_format="mp4",
-        )
-        edit_task_id = ((edit_submit.get("metadata") or {}).get("task_id")) or ""
-        edit_result = wait_for_poll_completion(
-            lambda: call_las_skill(
+        if skip_las_edit:
+            clip_url = original_tos_url
+            steps[1].update(
+                {
+                    "status": "skipped",
+                    "reason": "CB60_SKIP_LAS_EDIT=1，测试轮次直接跳过 LAS 高光剪辑。",
+                    "clip_url": clip_url,
+                }
+            )
+        else:
+            if deadline:
+                deadline.check("LAS highlight submit")
+            edit_module = load_skill_module("las_video_edit_skill", str(LAS_EDIT_SKILL_PATH))
+            edit_submit = call_las_skill(
                 config,
-                edit_module.poll_task,
-                edit_task_id,
+                edit_module.submit_task,
                 region=config.las_region,
-            ),
-            timeout_seconds=int(deadline.bounded_timeout(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS, "LAS highlight poll"))
-            if deadline
-            else int(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS),
-            interval_seconds=5,
-            deadline=deadline,
-            stage_label="LAS highlight poll",
-        )
+                video_url=original_tos_url,
+                output_tos_path=edit_output_prefix,
+                task_description=build_las_task_description(shot_label, shot_text),
+                mode="simple",
+                output_format="mp4",
+            )
+            edit_task_id = ((edit_submit.get("metadata") or {}).get("task_id")) or ""
+            edit_result = wait_for_poll_completion(
+                lambda: call_las_skill(
+                    config,
+                    edit_module.poll_task,
+                    edit_task_id,
+                    region=config.las_region,
+                ),
+                timeout_seconds=int(deadline.bounded_timeout(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS, "LAS highlight poll"))
+                if deadline
+                else int(DEFAULT_LAS_STAGE_POLL_TIMEOUT_SECONDS),
+                interval_seconds=5,
+                deadline=deadline,
+                stage_label="LAS highlight poll",
+            )
 
-        write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-edit.json", edit_result)
-        clips = ((edit_result.get("data") or {}).get("clips") or [])
-        first_clip = clips[0] if clips else {}
-        clip_url = first_clip.get("clip_url") if isinstance(first_clip, dict) else ""
-        if not clip_url:
-            raise EzvizError("LAS highlight step completed but returned no clip_url.")
-        steps[1].update(
-            {
-                "status": "completed",
-                "task_id": edit_task_id,
-                "clip_url": clip_url,
-                "clip_count": len(clips),
-            }
-        )
+            write_json_artifact(results_dir / f"{shot_index:02d}-{shot_id}-las-edit.json", edit_result)
+            clips = ((edit_result.get("data") or {}).get("clips") or [])
+            first_clip = clips[0] if clips else {}
+            clip_url = first_clip.get("clip_url") if isinstance(first_clip, dict) else ""
+            if not clip_url:
+                raise EzvizError("LAS highlight step completed but returned no clip_url.")
+            steps[1].update(
+                {
+                    "status": "completed",
+                    "task_id": edit_task_id,
+                    "clip_url": clip_url,
+                    "clip_count": len(clips),
+                }
+            )
 
         if deadline:
             deadline.check("LAS inpaint submit")

@@ -271,7 +271,7 @@ class TaskManagerTests(unittest.TestCase):
             status_root = Path(tmp) / "status"
             status_root.mkdir(parents=True, exist_ok=True)
             target_date = today_text()
-            sample_1_ts = time.time()
+            sample_1_ts = time.mktime(time.strptime(f"{target_date} 12:00:00", "%Y-%m-%d %H:%M:%S"))
             sample_2_ts = sample_1_ts + 3600
             (status_root / "samples.jsonl").write_text(
                 "\n".join(
@@ -422,6 +422,8 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["supportH265"], 1)
         self.assertEqual(spec["capture_command_rules"]["default_live_chain"]["stream_resolution_strategy"], "managed_stream_address_only")
         self.assertIn("高光剪辑 -> 去水印 -> 变高清", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
+        self.assertIn("4K 规格竖屏视频", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
+        self.assertIn("CB60_SKIP_LAS_EDIT=1", " ".join(spec["capture_command_rules"]["workflow_defaults"]))
         self.assertEqual(spec["custom_capture_rules"]["default_clip_duration_seconds"], 20)
         self.assertTrue(spec["custom_capture_rules"]["coexist_with_recurring_daily_schedule"])
 

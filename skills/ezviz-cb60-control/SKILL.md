@@ -305,9 +305,10 @@ Run commands from:
 41. If the orchestrator needs a machine-readable contract for this behavior, use `cb60_task_manager.py workflow-spec` instead of inventing a parallel command grammar.
 42. The default LAS edit prompt should prefer dynamic business highlights: serving dishes, kitchen prep, front-desk reception or operation, staff movement/interaction, tableware placement, and should remove static empty shots.
 43. The default LAS inpaint step should target visible watermarks and use precise detection by default.
-44. The default LAS resize step should output a 2K portrait result when the clip enters the full post-process chain.
-45. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
-46. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
+44. The default LAS resize step should output a 4K portrait result when the clip enters the full post-process chain.
+45. If `CB60_SKIP_LAS_EDIT=1`, the post-process chain should skip `las_highlight_edit` and continue with `upload_to_tos -> las_video_inpaint -> las_video_resize`. Use this for short test rounds where VLM highlight edit is known to be unstable.
+46. If the user requests zoom, explain that the current REST control path was rejected by the real CB60 device.
+47. If the user requests voice talk, explain that this skill currently stops at the SDK boundary and refer to `references/api-notes.md`.
 
 ## API Notes
 

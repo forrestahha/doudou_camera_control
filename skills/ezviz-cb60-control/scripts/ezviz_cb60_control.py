@@ -381,6 +381,7 @@ class EnvConfig:
     env_file_path: str = ""
     capture_wall_timeout_seconds: float = 180.0
     capture_with_las_wall_timeout_seconds: float = 5400.0
+    skip_las_edit: bool = False
 
     @classmethod
     def from_env(cls, env_file: Optional[str] = None) -> "EnvConfig":
@@ -413,6 +414,14 @@ class EnvConfig:
                 raise EzvizError(f"{name} must be greater than 0.")
             return value
 
+        def parse_bool_env(name: str, default: bool) -> bool:
+            raw = env.get(name, "1" if default else "0").strip().lower()
+            if raw in {"1", "true", "yes", "y", "on"}:
+                return True
+            if raw in {"0", "false", "no", "n", "off", ""}:
+                return False
+            raise EzvizError(f"{name} must be a boolean-like value such as 1/0/true/false.")
+
         return cls(
             app_key=env.get("EZVIZ_APP_KEY", "").strip(),
             app_secret=env.get("EZVIZ_APP_SECRET", "").strip(),
@@ -442,6 +451,7 @@ class EnvConfig:
             env_file_path=resolved_env_file,
             capture_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WALL_TIMEOUT_SECONDS", 180.0),
             capture_with_las_wall_timeout_seconds=parse_float_env("CB60_CAPTURE_WITH_LAS_WALL_TIMEOUT_SECONDS", 5400.0),
+            skip_las_edit=parse_bool_env("CB60_SKIP_LAS_EDIT", False),
         )
 
     def doctor(self) -> JsonDict:

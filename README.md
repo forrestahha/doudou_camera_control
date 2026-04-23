@@ -547,7 +547,21 @@ export LAS_INPAINT_FIXED_BBOXES='[[0,650,150,970]]'
 ```
 
 #### 变高清
-- 默认输出 **2K 规格竖屏视频**
+- 默认输出 **4K 规格竖屏视频**
+
+#### 测试模式：跳过 Edit
+- 如果当前测试轮次的视频较短，容易在 `LAS Edit` 上报 `Video.VLMFailed`
+- 可以显式设置：
+
+```bash
+export CB60_SKIP_LAS_EDIT='1'
+```
+
+- 设置后，正式后处理链路会改成：
+  - `upload_to_tos`
+  - `las_video_inpaint`
+  - `las_video_resize`
+- 也就是跳过 `LAS 高光剪辑`，直接继续去水印和 4K 变高清
 
 #### LAS 调用硬规则
 - OpenClaw 必须直接调用已安装的本地 LAS skills：
@@ -724,7 +738,7 @@ OpenClaw 在运行 `should-run-now` 时，现在要同时判断两件事：
   - 默认使用精细检测
   - 默认强化左下角时间水印区域
 - 变高清：
-  - 默认输出 2K 规格竖屏视频
+  - 默认输出 4K 规格竖屏视频
 
 ### 5. 一键查看这套规则
 
